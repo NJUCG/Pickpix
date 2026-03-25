@@ -1,9 +1,13 @@
 # pickpix图片挑选工具
 
+环境配置
+
+pip install -r requirements.txt
+
 代码运行
 
 ```
-pythhon pickpix.py
+python pickpix.py
 ```
 
 pickpix.exe为编译好可直接运行的发行版
