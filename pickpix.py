@@ -2,13 +2,21 @@ import os
 # 必须在导入 cv2 之前设置环境变量
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
+import io
 import re
+import posixpath
+import stat
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import glob
 import numpy as np
 import cv2
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
 
 
 class MultiMethodCropperGUI:
@@ -19,8 +27,15 @@ class MultiMethodCropperGUI:
         
         # 变量
         self.input_folder = ""
+        self.input_folders = []
+        self.input_sources = []
         self.output_folder = ""
+        self.output_target = None
         self.methods = []  # 子文件夹列表（方法名）
+        self.method_paths = {}  # {method_name: folder_path}
+        self.method_sources = {}  # {method_name: source_config}
+        self.remote_clients = {}  # {connection_key: {"transport": transport, "sftp": sftp}}
+        self.last_scan_errors = []
         self.frame_numbers = []  # 帧号列表
         self.current_frame_index = 0
         
@@ -61,6 +76,7 @@ class MultiMethodCropperGUI:
         self.box_colors = ['#FF0000', '#00FF00', '#0000FF', '#FFFF00', '#FF00FF', '#00FFFF', '#FFA500', '#800080']
         
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
     
     @staticmethod
     @staticmethod
@@ -114,6 +130,27 @@ class MultiMethodCropperGUI:
         else:
             raise ValueError(f"不支持的图片格式: {ext}")
     
+    @staticmethod
+    def load_image_bytes(file_name, data):
+        """Load image content from bytes for remote sources."""
+        ext = os.path.splitext(file_name)[1].lower()
+        
+        if ext == '.exr':
+            array = np.frombuffer(data, dtype=np.uint8)
+            img_data = cv2.imdecode(array, cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+            if img_data is None:
+                raise ValueError(f"无法解码远程EXR文件: {file_name}")
+            if len(img_data.shape) == 3:
+                img_data = cv2.cvtColor(img_data, cv2.COLOR_BGR2RGB)
+            img_data = np.clip(img_data, 0, None)
+            img_data = np.power(img_data, 1.0 / 2.2)
+            img_data = np.clip(img_data * 255, 0, 255).astype(np.uint8)
+            return Image.fromarray(img_data)
+        elif ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']:
+            return Image.open(io.BytesIO(data)).convert('RGB')
+        else:
+            raise ValueError(f"不支持的图片格式: {ext}")
+    
     def _on_mousewheel(self, event):
         """处理鼠标滚轮事件 - 缩放图片"""
         if not self.method_images:
@@ -155,13 +192,19 @@ class MultiMethodCropperGUI:
         control_frame.pack(side=tk.TOP, fill=tk.X)
         
         # 文件夹选择
-        tk.Button(control_frame, text="选择输入文件夹", command=self.select_input_folder, 
+        tk.Button(control_frame, text="添加输入文件夹", command=self.select_input_folder, 
                   bg="#4CAF50", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(control_frame, text="添加远程输入", command=self.open_remote_input_dialog,
+                  bg="#607D8B", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
         self.input_label = tk.Label(control_frame, text="未选择文件夹", fg="gray")
         self.input_label.pack(side=tk.LEFT, padx=5)
+        tk.Button(control_frame, text="清空输入", command=self.clear_input_folders,
+                  bg="#9E9E9E", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
         
         tk.Button(control_frame, text="选择输出文件夹", command=self.select_output_folder,
                   bg="#2196F3", fg="white", padx=10).pack(side=tk.LEFT, padx=20)
+        tk.Button(control_frame, text="选择远程输出", command=self.open_remote_output_dialog,
+                  bg="#455A64", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
         self.output_label = tk.Label(control_frame, text="未选择文件夹", fg="gray")
         self.output_label.pack(side=tk.LEFT, padx=5)
         
@@ -304,33 +347,535 @@ class MultiMethodCropperGUI:
         self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
         
     def select_input_folder(self):
-        folder = filedialog.askdirectory(title="选择包含子文件夹的根目录")
+        folder = filedialog.askdirectory(title="选择方法文件夹或包含方法文件夹的根目录")
         if folder:
             self.input_folder = folder
-            self.input_label.config(text=os.path.basename(folder), fg="black")
+            if folder not in self.input_folders:
+                self.input_folders.append(folder)
+                self.input_sources.append({
+                    "type": "local",
+                    "path": folder
+                })
             self.scan_methods_and_frames()
+    
+    def open_remote_input_dialog(self):
+        """Open a dialog to add an SFTP input source."""
+        if paramiko is None:
+            messagebox.showwarning("警告", "未安装 paramiko，暂时无法使用远程 SFTP 输入")
+            return
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("添加远程 SFTP 输入")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        fields = [
+            ("地址", "host", ""),
+            ("端口", "port", "22"),
+            ("账号", "username", ""),
+            ("密码", "password", ""),
+            ("远程路径", "remote_path", "")
+        ]
+        entries = {}
+        
+        for row, (label, key, default_value) in enumerate(fields):
+            tk.Label(dialog, text=label).grid(row=row, column=0, sticky=tk.W, padx=10, pady=6)
+            entry = tk.Entry(dialog, width=36, show="*" if key == "password" else "")
+            entry.grid(row=row, column=1, padx=10, pady=6)
+            if default_value:
+                entry.insert(0, default_value)
+            entries[key] = entry
+        
+        def submit_remote():
+            host = entries["host"].get().strip()
+            username = entries["username"].get().strip()
+            password = entries["password"].get()
+            remote_path = entries["remote_path"].get().strip()
+            port_text = entries["port"].get().strip() or "22"
+            
+            if not host or not username or not remote_path:
+                messagebox.showwarning("警告", "请填写地址、账号和远程路径", parent=dialog)
+                return
+            if not remote_path.startswith("/"):
+                messagebox.showwarning("警告", "远程路径必须是绝对路径，并以 / 开头", parent=dialog)
+                return
+            
+            try:
+                port = int(port_text)
+            except ValueError:
+                messagebox.showwarning("警告", "端口必须是整数", parent=dialog)
+                return
+            
+            remote_source = {
+                "type": "sftp",
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "path": remote_path
+            }
+            
+            self.input_sources.append(remote_source)
+            dialog.destroy()
+            self.scan_methods_and_frames()
+        
+        button_frame = tk.Frame(dialog)
+        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=(8, 12))
+        tk.Button(button_frame, text="取消", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(button_frame, text="添加", command=submit_remote, bg="#607D8B", fg="white", width=10).pack(side=tk.LEFT, padx=6)
+    
+    def get_remote_connection_key(self, source):
+        """Build a stable cache key for one SFTP source."""
+        return (
+            source.get("host", ""),
+            int(source.get("port", 22)),
+            source.get("username", ""),
+            source.get("password", "")
+        )
+    
+    def get_sftp_client(self, source):
+        """Create or reuse an SFTP client."""
+        if paramiko is None:
+            raise RuntimeError("未安装 paramiko，无法连接远程 SFTP")
+        
+        connection_key = self.get_remote_connection_key(source)
+        cached = self.remote_clients.get(connection_key)
+        if cached:
+            transport = cached.get("transport")
+            if transport is not None and transport.is_active():
+                return cached["sftp"]
+            self.close_remote_connection(connection_key)
+        
+        transport = paramiko.Transport((source["host"], int(source.get("port", 22))))
+        transport.connect(username=source["username"], password=source.get("password", ""))
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        self.remote_clients[connection_key] = {
+            "transport": transport,
+            "sftp": sftp
+        }
+        return sftp
+    
+    def close_remote_connection(self, connection_key):
+        """Close one cached SFTP connection."""
+        cached = self.remote_clients.pop(connection_key, None)
+        if not cached:
+            return
+        try:
+            cached["sftp"].close()
+        except:
+            pass
+        try:
+            cached["transport"].close()
+        except:
+            pass
+    
+    def close_all_remote_connections(self):
+        """Close all cached SFTP connections."""
+        for connection_key in list(self.remote_clients.keys()):
+            self.close_remote_connection(connection_key)
+    
+    def has_output_target(self):
+        """Whether an output destination has been configured."""
+        return self.output_target is not None and bool(self.output_target.get("path"))
+    
+    def ensure_remote_dir(self, sftp, remote_dir):
+        """Create remote directories recursively when needed."""
+        remote_dir = remote_dir.rstrip("/")
+        if not remote_dir:
+            return
+        
+        parts = remote_dir.split("/")
+        current = ""
+        if remote_dir.startswith("/"):
+            current = "/"
+        
+        for part in parts:
+            if not part:
+                continue
+            current = posixpath.join(current, part) if current not in ("", "/") else (f"/{part}" if current == "/" else part)
+            try:
+                sftp.stat(current)
+            except IOError:
+                sftp.mkdir(current)
+    
+    def join_output_path(self, *parts):
+        """Join output path parts according to the configured target type."""
+        if not self.output_target:
+            return ""
+        if self.output_target["type"] == "local":
+            return os.path.join(*parts)
+        cleaned = []
+        for idx, part in enumerate(parts):
+            if not part:
+                continue
+            normalized = str(part).replace("\\", "/")
+            if idx == 0:
+                if normalized == "/":
+                    cleaned.append("/")
+                else:
+                    cleaned.append(normalized.rstrip("/"))
+            else:
+                cleaned.append(normalized.strip("/"))
+        
+        if not cleaned:
+            return ""
+        
+        base = cleaned[0]
+        for part in cleaned[1:]:
+            if base == "/":
+                base = f"/{part}"
+            else:
+                base = posixpath.join(base, part)
+        return base
+    
+    def save_output_image(self, img, target_path):
+        """Save a PIL image to local disk or remote SFTP."""
+        if not self.output_target:
+            raise RuntimeError("未配置输出目标")
+        
+        if self.output_target["type"] == "local":
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            img.save(target_path, "PNG")
+            return
+        
+        remote_source = self.output_target
+        sftp = self.get_sftp_client(remote_source)
+        remote_dir = posixpath.dirname(target_path)
+        self.ensure_remote_dir(sftp, remote_dir)
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        with sftp.open(target_path, "wb") as remote_file:
+            remote_file.write(buffer.getvalue())
+        print(f"Saved remote output: {remote_source['host']}:{target_path}")
+    
+    def on_close(self):
+        """Clean up connections before closing the app."""
+        self.close_all_remote_connections()
+        self.root.destroy()
+    
+    def clear_input_folders(self):
+        """Clear selected input folders and reset related UI state."""
+        self.input_folder = ""
+        self.input_folders = []
+        self.input_sources = []
+        self.methods = []
+        self.method_paths = {}
+        self.method_sources = {}
+        self.frame_numbers = []
+        self.current_frame_index = 0
+        self.close_all_remote_connections()
+        for img in self.method_images.values():
+            try:
+                img.close()
+            except:
+                pass
+        self.method_images.clear()
+        self.display_images.clear()
+        self.photo_images.clear()
+        self.canvases.clear()
+        self.rect_ids.clear()
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.preview_canvas.delete("all")
+        self.methods_listbox.delete(0, tk.END)
+        self.input_label.config(text="未选择文件夹", fg="gray")
+        self.frame_info_label.config(text="帧: 0 / 0")
+        self.status_label.config(text="已清空输入文件夹")
             
     def select_output_folder(self):
         folder = filedialog.askdirectory(title="选择输出文件夹")
         if folder:
             self.output_folder = folder
+            self.output_target = {
+                "type": "local",
+                "path": folder
+            }
             self.output_label.config(text=os.path.basename(folder), fg="black")
+    
+    def open_remote_output_dialog(self):
+        """Open a dialog to configure an SFTP output target."""
+        if paramiko is None:
+            messagebox.showwarning("警告", "未安装 paramiko，暂时无法使用远程 SFTP 输出")
+            return
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("设置远程 SFTP 输出")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        fields = [
+            ("地址", "host", ""),
+            ("端口", "port", "22"),
+            ("账号", "username", ""),
+            ("密码", "password", ""),
+            ("远程输出路径", "remote_path", "")
+        ]
+        entries = {}
+        
+        for row, (label, key, default_value) in enumerate(fields):
+            tk.Label(dialog, text=label).grid(row=row, column=0, sticky=tk.W, padx=10, pady=6)
+            entry = tk.Entry(dialog, width=36, show="*" if key == "password" else "")
+            entry.grid(row=row, column=1, padx=10, pady=6)
+            if default_value:
+                entry.insert(0, default_value)
+            entries[key] = entry
+        
+        def submit_remote_output():
+            host = entries["host"].get().strip()
+            username = entries["username"].get().strip()
+            password = entries["password"].get()
+            remote_path = entries["remote_path"].get().strip()
+            port_text = entries["port"].get().strip() or "22"
             
+            if not host or not username or not remote_path:
+                messagebox.showwarning("警告", "请填写地址、账号和远程输出路径", parent=dialog)
+                return
+            if not remote_path.startswith("/"):
+                messagebox.showwarning("警告", "远程输出路径必须是绝对路径，并以 / 开头", parent=dialog)
+                return
+            
+            try:
+                port = int(port_text)
+            except ValueError:
+                messagebox.showwarning("警告", "端口必须是整数", parent=dialog)
+                return
+            
+            self.output_target = {
+                "type": "sftp",
+                "host": host,
+                "port": port,
+                "username": username,
+                "password": password,
+                "path": remote_path
+            }
+            try:
+                sftp = self.get_sftp_client(self.output_target)
+                self.ensure_remote_dir(sftp, remote_path)
+            except Exception as exc:
+                self.output_target = None
+                messagebox.showerror("错误", f"远程输出路径不可用: {exc}", parent=dialog)
+                return
+            self.output_folder = remote_path
+            self.output_label.config(text=f"{host}:{remote_path}", fg="black")
+            dialog.destroy()
+        
+        button_frame = tk.Frame(dialog)
+        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=(8, 12))
+        tk.Button(button_frame, text="取消", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(button_frame, text="确定", command=submit_remote_output, bg="#455A64", fg="white", width=10).pack(side=tk.LEFT, padx=6)
+    
+    def local_folder_has_frames(self, folder_path):
+        """Return True when the local folder directly contains frame images."""
+        for ext in ['exr', 'png']:
+            pattern = os.path.join(folder_path, f"frame*.{ext}")
+            if glob.glob(pattern):
+                return True
+        return False
+    
+    def remote_folder_has_frames(self, source):
+        """Return True when the remote SFTP folder directly contains frame images."""
+        names = self.list_remote_entries(source)
+        for name in names:
+            if re.match(r"frame\d+\.(exr|png)$", name, re.IGNORECASE):
+                return True
+        return False
+    
+    def list_remote_entries(self, source):
+        """List file names in a remote SFTP folder."""
+        sftp = self.get_sftp_client(source)
+        return sftp.listdir(source["path"])
+    
+    def remote_is_dir(self, source):
+        """Check whether the remote SFTP path is a directory."""
+        sftp = self.get_sftp_client(source)
+        mode = sftp.stat(source["path"]).st_mode
+        return stat.S_ISDIR(mode)
+    
+    def build_child_source(self, source, child_name):
+        """Build a source config for a child folder under the same source."""
+        child_source = dict(source)
+        if source["type"] == "local":
+            child_source["path"] = os.path.join(source["path"], child_name)
+        else:
+            child_source["path"] = posixpath.join(source["path"], child_name)
+        return child_source
+    
+    def source_has_frames(self, source):
+        """Check whether one source directly contains frame images."""
+        if source["type"] == "local":
+            return self.local_folder_has_frames(source["path"])
+        if source["type"] == "sftp":
+            try:
+                return self.remote_folder_has_frames(source)
+            except Exception as exc:
+                self.last_scan_errors.append(f"{source['host']}:{source['path']} - {exc}")
+                return False
+        return False
+    
+    def get_source_display_name(self, source):
+        """Human-readable label for an input source."""
+        if source["type"] == "local":
+            return os.path.basename(source["path"])
+        return f"{source['host']}:{source['path']}"
+    
+    def get_output_display_name(self):
+        """Human-readable label for the configured output target."""
+        if not self.output_target:
+            return ""
+        if self.output_target["type"] == "local":
+            return self.output_target["path"]
+        return f"{self.output_target['host']}:{self.output_target['path']}"
+    
+    def make_unique_method_name(self, base_name, folder_path, used_names):
+        """Avoid collisions when different folders share the same name."""
+        normalized_path = folder_path.rstrip("/\\")
+        base_name = base_name or os.path.basename(normalized_path) or normalized_path
+        parent_name = os.path.basename(os.path.dirname(normalized_path)) or "root"
+        grandparent_name = os.path.basename(os.path.dirname(os.path.dirname(normalized_path))) or "root"
+        candidate = f"{grandparent_name}_{parent_name}_{base_name}"
+        if candidate not in used_names:
+            return candidate
+        
+        index = 2
+        while True:
+            candidate = f"{grandparent_name}_{parent_name}_{base_name}_{index}"
+            if candidate not in used_names:
+                return candidate
+            index += 1
+    
+    def collect_method_folders(self):
+        """Collect method folders from local folders or remote SFTP paths."""
+        method_entries = []
+        seen_sources = set()
+        self.last_scan_errors = []
+        
+        for source in self.input_sources:
+            if source["type"] == "local" and not os.path.isdir(source["path"]):
+                continue
+            
+            source_key = (source["type"], source.get("host", ""), source.get("port", 22), source["path"])
+            if source_key in seen_sources:
+                continue
+            
+            if self.source_has_frames(source):
+                method_entries.append((os.path.basename(source["path"]), source))
+                seen_sources.add(source_key)
+                continue
+            
+            if source["type"] == "local":
+                child_names = sorted(os.listdir(source["path"]))
+            else:
+                try:
+                    child_names = sorted(self.list_remote_entries(source))
+                except Exception as exc:
+                    self.last_scan_errors.append(f"{source['host']}:{source['path']} - {exc}")
+                    continue
+            
+            for name in child_names:
+                child_source = self.build_child_source(source, name)
+                child_key = (child_source["type"], child_source.get("host", ""), child_source.get("port", 22), child_source["path"])
+                
+                if source["type"] == "local":
+                    if not os.path.isdir(child_source["path"]) or child_key in seen_sources:
+                        continue
+                else:
+                    if child_key in seen_sources:
+                        continue
+                    try:
+                        if not self.remote_is_dir(child_source):
+                            continue
+                    except Exception as exc:
+                        self.last_scan_errors.append(f"{source['host']}:{child_source['path']} - {exc}")
+                        continue
+                
+                if self.source_has_frames(child_source):
+                    method_entries.append((name, child_source))
+                    seen_sources.add(child_key)
+        
+        return method_entries
+    
+    def list_method_frame_files(self, source):
+        """List all frame image entries for one method source."""
+        if source["type"] == "local":
+            files = []
+            for ext in ['exr', 'png']:
+                pattern = os.path.join(source["path"], f"frame*.{ext}")
+                files.extend(glob.glob(pattern))
+            return files
+        
+        names = self.list_remote_entries(source)
+        files = []
+        for name in names:
+            if re.match(r"frame\d+\.(exr|png)$", name, re.IGNORECASE):
+                files.append(posixpath.join(source["path"], name))
+        return files
+    
+    def get_frame_image_entry(self, method, frame_num):
+        """Return the image path or remote entry for one method/frame pair."""
+        source = self.method_sources.get(method)
+        if not source:
+            return None
+        
+        if source["type"] == "local":
+            for ext in ['exr', 'png']:
+                test_path = os.path.join(source["path"], f"frame{frame_num}.{ext}")
+                if os.path.exists(test_path):
+                    return test_path
+            return None
+        
+        try:
+            names = self.list_remote_entries(source)
+        except Exception:
+            return None
+        
+        for ext in ['exr', 'png']:
+            target_name = f"frame{frame_num}.{ext}".lower()
+            for name in names:
+                if name.lower() == target_name:
+                    return posixpath.join(source["path"], name)
+        return None
+    
+    def load_method_frame_image(self, method, frame_num):
+        """Load one method/frame image from local disk or remote SFTP."""
+        source = self.method_sources.get(method)
+        image_entry = self.get_frame_image_entry(method, frame_num)
+        if not source or not image_entry:
+            return None
+        
+        if source["type"] == "local":
+            return self.load_image(image_entry)
+        
+        sftp = self.get_sftp_client(source)
+        with sftp.open(image_entry, "rb") as remote_file:
+            data = remote_file.read()
+        return self.load_image_bytes(image_entry, data)
+             
     def scan_methods_and_frames(self):
         """扫描子文件夹和帧序列"""
-        if not self.input_folder:
+        if not self.input_sources:
             return
         
-        # 获取所有子文件夹
-        subdirs = [d for d in os.listdir(self.input_folder) 
-                   if os.path.isdir(os.path.join(self.input_folder, d))]
+        method_entries = self.collect_method_folders()
         
-        if not subdirs:
-            messagebox.showwarning("警告", "未找到子文件夹")
+        if not method_entries:
+            message = "未找到包含 frame*.exr 或 frame*.png 的本地/远程方法路径"
+            if self.last_scan_errors:
+                message += "\n\n连接错误:\n" + "\n".join(self.last_scan_errors[:3])
+            messagebox.showwarning("警告", message)
             return
         
-        self.methods = subdirs
-        self.methods.sort()
+        self.methods = []
+        self.method_paths = {}
+        self.method_sources = {}
+        used_names = set()
+        for base_name, source in method_entries:
+            method_name = self.make_unique_method_name(base_name, source["path"], used_names)
+            used_names.add(method_name)
+            self.methods.append(method_name)
+            self.method_paths[method_name] = source["path"]
+            self.method_sources[method_name] = source
         
         # 更新方法列表
         self.methods_listbox.delete(0, tk.END)
@@ -342,22 +887,18 @@ class MultiMethodCropperGUI:
         methods_with_frames = []
         
         for method in self.methods:
-            method_path = os.path.join(self.input_folder, method)
+            method_source = self.method_sources[method]
+            method_path = self.method_paths[method]
             
-            # 查找该方法下的所有Color.*.exr和Color.*.png文件
-            files = []
-            for ext in ['exr', 'png']:
-                pattern = os.path.join(method_path, f"Color.*.{ext}")
-                files.extend(glob.glob(pattern))
+            files = self.list_method_frame_files(method_source)
             
             if files:
                 methods_with_frames.append(method)
                 
             # 提取帧号
             for f in files:
-                basename = os.path.basename(f)
-                # 匹配 Color.XXXX.exr 或 Color.XXXX.png
-                match = re.search(r'Color\.(\d+)\.(exr|png)', basename, re.IGNORECASE)
+                basename = os.path.basename(f) if method_source["type"] == "local" else posixpath.basename(f)
+                match = re.search(r'frame(\d+)\.(exr|png)', basename, re.IGNORECASE)
                 if match:
                     frame_numbers.add(match.group(1))
         
@@ -366,11 +907,15 @@ class MultiMethodCropperGUI:
         if not self.frame_numbers:
             messagebox.showwarning(
                 "警告", 
-                f"在所有子文件夹中都未找到 Color.*.exr 或 Color.*.png 文件\n"
-                f"已扫描的文件夹: {', '.join(self.methods)}"
+                f"在已选择的文件夹中都未找到 frame*.exr 或 frame*.png 文件\n"
+                f"已扫描的方法: {', '.join(self.methods)}"
             )
             return
         
+        self.input_label.config(
+            text=f"已打开 {len(self.input_sources)} 个输入",
+            fg="black"
+        )
         self.status_label.config(
             text=f"已加载 {len(self.methods)} 个方法，{len(self.frame_numbers)} 帧 "
                  f"(有帧的方法: {', '.join(methods_with_frames)})"
@@ -426,21 +971,16 @@ class MultiMethodCropperGUI:
                     bg="#E3F2FD", pady=5).pack(fill=tk.X)
             
             # 查找图片路径（优先exr，如果不存在则尝试png）
-            img_path = None
-            for ext in ['exr', 'png']:
-                test_path = os.path.join(self.input_folder, method, f"Color.{frame_num}.{ext}")
-                if os.path.exists(test_path):
-                    img_path = test_path
-                    break
+            img_path = self.get_frame_image_entry(method, frame_num)
             
             if img_path is None:
-                tk.Label(method_frame, text=f"文件不存在: Color.{frame_num}.(exr|png)", 
+                tk.Label(method_frame, text=f"文件不存在: frame{frame_num}.(exr|png)", 
                         fg="red").pack()
                 continue
             
             try:
                 # 加载图片（自动识别格式）
-                img = self.load_image(img_path)
+                img = self.load_method_frame_image(method, frame_num)
                 
                 self.method_images[method] = img
                 
@@ -952,12 +1492,13 @@ class MultiMethodCropperGUI:
             messagebox.showwarning("警告", "请先添加至少一个裁剪框")
             return
         
-        if not self.output_folder:
+        if not self.has_output_target():
             messagebox.showwarning("警告", "请先选择输出文件夹")
             return
         
         frame_num = self.frame_numbers[self.current_frame_index]
         success_count = 0
+        collage_data = []
         
         for method in self.methods:
             if method not in self.method_images:
@@ -965,44 +1506,203 @@ class MultiMethodCropperGUI:
             
             try:
                 img = self.method_images[method]
-                output_method_folder = os.path.join(self.output_folder, method)
-                os.makedirs(output_method_folder, exist_ok=True)
+                output_method_folder = self.join_output_path(self.output_target["path"], method)
+                cropped_images = []
                 
                 # 裁剪并保存每个裁剪框
                 for box_idx, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
                     cropped = img.crop((x1, y1, x2, y2))
+                    cropped_images.append(cropped.copy())
                     
                     # 保存为PNG格式
-                    output_path = os.path.join(output_method_folder, f"Color.{frame_num}_box{box_idx}.png")
-                    cropped.save(output_path, "PNG")
+                    output_path = self.join_output_path(output_method_folder, f"frame{frame_num}_box{box_idx}.png")
+                    self.save_output_image(cropped, output_path)
                 
                 # 生成可视化标记图
                 self.save_visualization_map(img, output_method_folder, frame_num)
+                collage_data.append({
+                    "method": method,
+                    "full": self.create_visualization_map_image(img),
+                    "crops": cropped_images
+                })
                 
                 success_count += 1
                 
             except Exception as e:
                 print(f"处理 {method} 帧 {frame_num} 失败: {e}")
         
-        messagebox.showinfo("完成", f"当前帧批量裁剪完成！\n成功: {success_count} 个方法\n每个方法裁剪了 {len(self.crop_boxes)} 个区域\n输出位置: {self.output_folder}")
+        messagebox.showinfo("完成", f"当前帧批量裁剪完成！\n成功: {success_count} 个方法\n每个方法裁剪了 {len(self.crop_boxes)} 个区域\n输出位置: {self.get_output_display_name()}")
         self.status_label.config(text=f"完成！成功处理 {success_count} 个方法")
+    
+        if collage_data:
+            self.save_current_frame_collage(frame_num, collage_data)
+            for item in collage_data:
+                item["full"].close()
+                for crop_img in item["crops"]:
+                    crop_img.close()
+    
+    def create_visualization_map_image(self, img):
+        """Create an in-memory visualization image with all crop boxes."""
+        vis_img = img.copy()
+        draw = ImageDraw.Draw(vis_img)
+        
+        for idx, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
+            color = self.box_colors[(idx - 1) % len(self.box_colors)]
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
+        
+        return vis_img
+    
+    def resize_for_collage(self, img, max_width, max_height):
+        """Resize a PIL image to fit inside the target box."""
+        copy_img = img.copy()
+        copy_img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+        return copy_img
+    
+    
+    def save_current_frame_collage(self, frame_num, collage_data):
+        """Save one overview image for the current frame."""
+        if not collage_data:
+            return
+        
+        font = ImageFont.load_default()
+        padding = 24
+        header_gap = 12
+        header_height = 18
+        image_gap = 0
+        title_gap = 10
+        label_gap = 4
+        label_height = 14
+        separator_gap = 20
+        separator_height = 4
+        section_title_height = 16
+        max_canvas_width = 2200
+        max_canvas_height = 1800
+        
+        method_count = max(1, len(collage_data))
+        section_count = len(self.crop_boxes) + 1
+        base_full_thumb_size = (320, 220)
+        base_crop_thumb_size = (220, 220)
+        base_width = padding * 2 + max(
+            method_count * base_full_thumb_size[0],
+            method_count * base_crop_thumb_size[0]
+        )
+        base_height = (
+            padding * 2
+            + (section_title_height + title_gap + base_full_thumb_size[1] + label_gap + label_height)
+            + len(self.crop_boxes) * (section_title_height + title_gap + base_crop_thumb_size[1] + label_gap + label_height)
+            + (section_count - 1) * (separator_gap + separator_height)
+        )
+        scale = min(1.0, max_canvas_width / base_width, max_canvas_height / base_height)
+        scale = max(scale, 0.35)
+        
+        padding = max(16, int(padding * max(scale, 0.6)))
+        title_gap = max(8, int(title_gap * max(scale, 0.6)))
+        label_gap = max(3, int(label_gap * max(scale, 0.6)))
+        separator_gap = max(12, int(separator_gap * max(scale, 0.6)))
+        separator_height = max(2, int(separator_height * max(scale, 0.6)))
+        full_thumb_size = (
+            max(140, int(base_full_thumb_size[0] * scale)),
+            max(96, int(base_full_thumb_size[1] * scale))
+        )
+        crop_thumb_size = (
+            max(96, int(base_crop_thumb_size[0] * scale)),
+            max(96, int(base_crop_thumb_size[1] * scale))
+        )
+        
+        sections = [
+            ("Full Images", [(item["method"], item["full"]) for item in collage_data], full_thumb_size)
+        ]
+        
+        for box_idx in range(len(self.crop_boxes)):
+            sections.append((
+                f"Box {box_idx + 1}",
+                [(item["method"], item["crops"][box_idx]) for item in collage_data if box_idx < len(item["crops"])],
+                crop_thumb_size
+            ))
+        
+        prepared_sections = []
+        canvas_width = 0
+        
+        for title, items, thumb_size in sections:
+            thumbs = []
+            
+            for method, image in items:
+                thumbs.append((method, self.resize_for_collage(image, thumb_size[0], thumb_size[1])))
+            
+            strip_width = sum(thumb.width for _, thumb in thumbs)
+            if len(thumbs) > 1:
+                strip_width += image_gap * (len(thumbs) - 1)
+            max_thumb_height = max((thumb.height for _, thumb in thumbs), default=0)
+            strip_height = max_thumb_height + label_gap + label_height
+            group_height = section_title_height + title_gap + strip_height
+            canvas_width = max(canvas_width, strip_width)
+            
+            prepared_sections.append({
+                "title": title,
+                "thumbs": thumbs,
+                "height": group_height,
+                "strip_height": strip_height,
+                "max_thumb_height": max_thumb_height
+            })
+        
+        canvas_width += padding * 2
+        canvas_height = padding * 2 + header_height + header_gap
+        canvas_height += sum(section["height"] for section in prepared_sections)
+        canvas_height += separator_gap * (len(prepared_sections) - 1)
+        canvas_height += separator_height * (len(prepared_sections) - 1)
+        
+        collage = Image.new("RGB", (canvas_width, canvas_height), "white")
+        draw = ImageDraw.Draw(collage)
+        
+        current_y = padding
+        draw.text((padding, current_y), f"Frame {frame_num}", fill="black", font=font)
+        current_y += header_height + header_gap
+        for section_idx, section in enumerate(prepared_sections):
+            draw.text((padding, current_y), section["title"], fill="black", font=font)
+            current_y += section_title_height + title_gap
+            
+            current_x = padding
+            for method, thumb in section["thumbs"]:
+                thumb_y = current_y
+                collage.paste(thumb, (current_x, thumb_y))
+                
+                label_box = draw.textbbox((0, 0), method, font=font)
+                label_width = label_box[2] - label_box[0]
+                label_x = current_x + max(0, (thumb.width - label_width) // 2)
+                label_y = current_y + section["max_thumb_height"] + label_gap
+                draw.text((label_x, label_y), method, fill="black", font=font)
+                
+                thumb.close()
+                current_x += thumb.width + image_gap
+            
+            current_y += section["strip_height"]
+            
+            if section_idx < len(prepared_sections) - 1:
+                current_y += separator_gap // 2
+                draw.rectangle(
+                    [padding, current_y, canvas_width - padding, current_y + separator_height],
+                    fill="#C8C8C8"
+                )
+                current_y += separator_height + separator_gap // 2
+        
+        collage_path = self.join_output_path(self.output_target["path"], f"frame{frame_num}_summary.png")
+        self.save_output_image(collage, collage_path)
+        collage.close()
+        print(f"Saved collage overview: {collage_path}")
     
     def save_visualization_map(self, img, output_folder, frame_num):
         """生成并保存裁剪框可视化标记图（仅框本身）"""
         # 创建图片副本用于绘制
-        vis_img = img.copy()
-        draw = ImageDraw.Draw(vis_img)
+        vis_img = self.create_visualization_map_image(img)
         
         # 绘制每个裁剪框（只绘制框，不绘制数字）
-        for idx, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
-            color = self.box_colors[(idx - 1) % len(self.box_colors)]
             
             # 绘制矩形框
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
         
         # 保存可视化图
-        vis_path = os.path.join(output_folder, f"Color.{frame_num}_boxes_map.png")
-        vis_img.save(vis_path, "PNG")
+        vis_path = self.join_output_path(output_folder, f"frame{frame_num}_boxes_map.png")
+        self.save_output_image(vis_img, vis_path)
+        vis_img.close()
         print(f"已保存可视化标记图: {vis_path}")
         
     def batch_crop_all(self):
@@ -1011,7 +1711,7 @@ class MultiMethodCropperGUI:
             messagebox.showwarning("警告", "请先添加至少一个裁剪框")
             return
         
-        if not self.output_folder:
+        if not self.has_output_target():
             messagebox.showwarning("警告", "请先选择输出文件夹")
             return
         
@@ -1025,7 +1725,7 @@ class MultiMethodCropperGUI:
             f"- 共 {total_images} 张图片\n"
             f"- 每张图片裁剪 {len(self.crop_boxes)} 个区域\n"
             f"- 总共生成 {total_images * len(self.crop_boxes)} 个裁剪图\n"
-            f"输出到: {self.output_folder}\n\n"
+            f"输出到: {self.get_output_display_name()}\n\n"
             f"确定继续吗？"
         )
         
@@ -1040,8 +1740,7 @@ class MultiMethodCropperGUI:
         
         for method in self.methods:
             # 创建输出子文件夹
-            output_method_folder = os.path.join(self.output_folder, method)
-            os.makedirs(output_method_folder, exist_ok=True)
+            output_method_folder = self.join_output_path(self.output_target["path"], method)
             
             for frame_num in self.frame_numbers:
                 total += 1
@@ -1052,18 +1751,12 @@ class MultiMethodCropperGUI:
                     self.root.update()
                     
                     # 查找图片路径（优先exr，如果不存在则尝试png）
-                    img_path = None
-                    for ext in ['exr', 'png']:
-                        test_path = os.path.join(self.input_folder, method, f"Color.{frame_num}.{ext}")
-                        if os.path.exists(test_path):
-                            img_path = test_path
-                            break
-                    
+                    img_path = self.get_frame_image_entry(method, frame_num)
                     if img_path is None:
                         fail_count += 1
                         continue
                     
-                    img = self.load_image(img_path)
+                    img = self.load_method_frame_image(method, frame_num)
                     
                     # 裁剪并保存每个裁剪框
                     for box_idx, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
@@ -1074,8 +1767,8 @@ class MultiMethodCropperGUI:
                         cropped = img.crop((x1, y1, x2, y2))
                         
                         # 保存为PNG格式
-                        output_path = os.path.join(output_method_folder, f"Color.{frame_num}_box{box_idx}.png")
-                        cropped.save(output_path, "PNG")
+                        output_path = self.join_output_path(output_method_folder, f"frame{frame_num}_box{box_idx}.png")
+                        self.save_output_image(cropped, output_path)
                     
                     # 生成可视化标记图
                     self.save_visualization_map(img, output_method_folder, frame_num)
@@ -1101,7 +1794,7 @@ class MultiMethodCropperGUI:
             f"批量裁剪完成！\n"
             f"成功: {success_count} 张\n"
             f"失败: {fail_count} 张\n"
-            f"输出位置: {self.output_folder}"
+            f"输出位置: {self.get_output_display_name()}"
         )
         
         self.status_label.config(text=f"完成！成功 {success_count} 张，失败 {fail_count} 张")
