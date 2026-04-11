@@ -1,0 +1,1 @@
+"""PickPix application package."""

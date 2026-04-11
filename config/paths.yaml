@@ -1,0 +1,24 @@
+app:
+  title: PickPix Multi Method Cropper
+  geometry: 1600x1000
+
+servers:
+  server_1:
+    label: Server 191
+    host: 114.212.190.191
+    port: 22
+    username: yy
+    password: 444555yy
+  server_2:
+    label: Server 52
+    host: 114.212.190.52
+    port: 22
+    username: yy
+    password: NJU#!$$!!cg
+
+paths:
+  project_root: .
+  config_dir: config
+  frontend_dir: pickpix_app/frontend
+  backend_dir: pickpix_app/backend
+  default_output_dir: output
