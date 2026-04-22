@@ -31,8 +31,16 @@ class MultiMethodCropperGUI:
         self.output_folder = str(self.config.default_output_dir)
         self.output_target = None
         self.methods = []  # 子文件夹列表（方法名）
+        self.all_methods = []  # 扫描得到的全部方法名
         self.method_paths = {}  # {method_name: folder_path}
         self.method_sources = {}  # {method_name: source_config}
+        self.methods_with_frames = []
+        self.method_filter_vars = {}
+        self.methods_summary_label = None
+        self.method_filter_canvas = None
+        self.method_filter_content = None
+        self.method_filter_canvas_window = None
+        self.method_filter_scrollbar = None
         self.last_scan_errors = []
         self.frame_numbers = []  # 帧号列表
         self.current_frame_index = 0
@@ -374,6 +382,78 @@ class MultiMethodCropperGUI:
         # 重绘裁剪框
         self.redraw_all_rectangles()
         self.status_label.config(text="缩放已重置到1:1")
+
+    def on_method_filter_canvas_configure(self, event):
+        if self.method_filter_canvas is not None and self.method_filter_canvas_window is not None:
+            self.method_filter_canvas.itemconfigure(self.method_filter_canvas_window, width=event.width)
+
+    def on_method_filter_mousewheel(self, event):
+        if self.method_filter_canvas is None:
+            return None
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = -1 if event.delta > 0 else 1
+        elif getattr(event, "num", None) in (4, 5):
+            delta = -1 if event.num == 4 else 1
+        if delta:
+            self.method_filter_canvas.yview_scroll(delta, "units")
+            return "break"
+        return None
+
+    def rebuild_method_filter_ui(self):
+        if self.method_filter_content is None:
+            return
+
+        for widget in self.method_filter_content.winfo_children():
+            widget.destroy()
+
+        self.method_filter_vars = {}
+
+        if not self.all_methods:
+            tk.Label(self.method_filter_content, text="扫描后将在这里列出方法", fg="gray").pack(anchor=tk.W, pady=4)
+            self.update_method_filter_summary()
+            return
+
+        for method in self.all_methods:
+            var = tk.BooleanVar(value=True)
+            self.method_filter_vars[method] = var
+            check = tk.Checkbutton(
+                self.method_filter_content,
+                text=method,
+                variable=var,
+                anchor="w",
+                command=self.on_method_filter_changed,
+            )
+            check.pack(fill=tk.X, anchor=tk.W)
+            check.bind("<MouseWheel>", self.on_method_filter_mousewheel)
+
+        self.update_method_filter_summary()
+
+    def update_method_filter_summary(self):
+        if self.methods_summary_label is not None:
+            self.methods_summary_label.config(text=f"显示 {len(self.methods)} / {len(self.all_methods)}")
+
+    def update_method_status(self):
+        self.update_method_filter_summary()
+        self.status_label.config(
+            text=f"已扫描 {len(self.all_methods)} 个方法，当前显示 {len(self.methods)} 个，{len(self.frame_numbers)} 帧"
+        )
+
+    def refresh_visible_methods(self, reload_frame=True):
+        self.methods = [method for method in self.all_methods if self.method_filter_vars.get(method, tk.BooleanVar()).get()]
+        self.update_method_status()
+        if reload_frame and self.frame_numbers:
+            self.load_current_frame()
+        elif not self.methods:
+            self.preview_canvas.delete("all")
+
+    def on_method_filter_changed(self):
+        self.refresh_visible_methods(reload_frame=True)
+
+    def set_all_method_filters(self, selected):
+        for var in self.method_filter_vars.values():
+            var.set(selected)
+        self.refresh_visible_methods(reload_frame=True)
         
     def setup_ui(self):
         # 顶部控制面板
@@ -477,9 +557,41 @@ class MultiMethodCropperGUI:
         # 方法列表
         methods_frame = tk.LabelFrame(right_frame, text="检测到的方法", padx=10, pady=5)
         methods_frame.pack(fill=tk.X, pady=5)
-        
-        self.methods_listbox = tk.Listbox(methods_frame, height=4)  # 减小高度
-        self.methods_listbox.pack(fill=tk.BOTH, expand=True)
+
+        methods_toolbar = tk.Frame(methods_frame)
+        methods_toolbar.pack(fill=tk.X, pady=(0, 4))
+        tk.Button(methods_toolbar, text="全选", command=lambda: self.set_all_method_filters(True), width=6).pack(side=tk.LEFT)
+        tk.Button(methods_toolbar, text="全不选", command=lambda: self.set_all_method_filters(False), width=6).pack(side=tk.LEFT, padx=(6, 0))
+        self.methods_summary_label = tk.Label(methods_toolbar, text="显示 0 / 0", fg="gray")
+        self.methods_summary_label.pack(side=tk.RIGHT)
+
+        methods_list_container = tk.Frame(methods_frame, height=220)
+        methods_list_container.pack(fill=tk.BOTH, expand=True)
+        methods_list_container.pack_propagate(False)
+
+        self.method_filter_canvas = tk.Canvas(methods_list_container, highlightthickness=0, height=150)
+        self.method_filter_scrollbar = tk.Scrollbar(
+            methods_list_container,
+            orient=tk.VERTICAL,
+            command=self.method_filter_canvas.yview,
+            width=16,
+        )
+        self.method_filter_content = tk.Frame(self.method_filter_canvas)
+        self.method_filter_content.bind(
+            "<Configure>",
+            lambda e: self.method_filter_canvas.configure(scrollregion=self.method_filter_canvas.bbox("all"))
+        )
+        self.method_filter_canvas_window = self.method_filter_canvas.create_window(
+            (0, 0), window=self.method_filter_content, anchor="nw"
+        )
+        self.method_filter_canvas.configure(yscrollcommand=self.method_filter_scrollbar.set)
+        self.method_filter_canvas.bind("<Configure>", self.on_method_filter_canvas_configure)
+        self.method_filter_canvas.bind("<MouseWheel>", self.on_method_filter_mousewheel)
+        self.method_filter_content.bind("<MouseWheel>", self.on_method_filter_mousewheel)
+
+        self.method_filter_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.method_filter_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.rebuild_method_filter_ui()
         
         # 裁剪信息
         info_frame = tk.LabelFrame(right_frame, text="当前裁剪框", padx=10, pady=5)
@@ -690,8 +802,10 @@ class MultiMethodCropperGUI:
         self.input_folders = []
         self.input_sources = []
         self.methods = []
+        self.all_methods = []
         self.method_paths = {}
         self.method_sources = {}
+        self.methods_with_frames = []
         self.frame_numbers = []
         self.current_frame_index = 0
         self.close_all_remote_connections()
@@ -708,7 +822,7 @@ class MultiMethodCropperGUI:
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.preview_canvas.delete("all")
-        self.methods_listbox.delete(0, tk.END)
+        self.rebuild_method_filter_ui()
         self.input_label.config(text="未选择文件夹", fg="gray")
         self.frame_info_label.config(text="帧: 0 / 0")
         self.status_label.config(text="已清空输入文件夹")
@@ -886,15 +1000,15 @@ class MultiMethodCropperGUI:
             messagebox.showwarning("警告", message)
             return
         
-        self.methods = result.methods
+        self.all_methods = result.methods
+        self.methods = list(result.methods)
         self.method_paths = result.method_paths
         self.method_sources = result.method_sources
+        self.methods_with_frames = result.methods_with_frames
         self.frame_numbers = result.frame_numbers
-        
-        # 更新方法列表
-        self.methods_listbox.delete(0, tk.END)
-        for method in self.methods:
-            self.methods_listbox.insert(tk.END, method)
+
+        self.rebuild_method_filter_ui()
+        self.refresh_visible_methods(reload_frame=False)
         methods_with_frames = result.methods_with_frames
         self.frame_numbers = result.frame_numbers
         
@@ -912,7 +1026,7 @@ class MultiMethodCropperGUI:
             fg="black"
         )
         self.status_label.config(
-            text=f"已加载 {len(self.methods)} 个方法，{len(self.frame_numbers)} 帧 "
+            text=f"已扫描 {len(self.all_methods)} 个方法，当前显示 {len(self.methods)} 个，{len(self.frame_numbers)} 帧 "
                  f"(有帧的方法: {', '.join(methods_with_frames)})"
         )
         
@@ -947,6 +1061,20 @@ class MultiMethodCropperGUI:
         # 触发垃圾回收
         import gc
         gc.collect()
+
+        self.frame_info_label.config(
+            text=f"帧: {self.current_frame_index + 1} / {len(self.frame_numbers)} (帧号: {frame_num})"
+        )
+
+        if not self.methods:
+            self.preview_canvas.delete("all")
+            tk.Label(
+                self.scrollable_frame,
+                text="当前没有选中的方法，请在右侧勾选要显示的子文件夹",
+                fg="gray",
+                pady=20,
+            ).pack()
+            return
         
         target_width = self.method_view_size
         target_height = self.method_view_size
@@ -1022,11 +1150,6 @@ class MultiMethodCropperGUI:
         total_rows = (len(self.methods) + cols_per_row - 1) // cols_per_row
         for r in range(total_rows):
             self.scrollable_frame.grid_rowconfigure(r, weight=1)
-        
-        # 更新帧信息
-        self.frame_info_label.config(
-            text=f"帧: {self.current_frame_index + 1} / {len(self.frame_numbers)} (帧号: {frame_num})"
-        )
         
         # 如果有选区，重新绘制
         if self.crop_start_x is not None:
