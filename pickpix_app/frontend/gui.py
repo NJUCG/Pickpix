@@ -20,7 +20,7 @@ class MultiMethodCropperGUI:
     def __init__(self, root):
         self.root = root
         self.config = AppConfig()
-        self.backend = PickPixBackend()
+        self.backend = PickPixBackend(self.config.input_filename_patterns)
         self.root.title(self.config.title)
         self.root.geometry(self.config.geometry)
         
@@ -43,11 +43,17 @@ class MultiMethodCropperGUI:
         self.photo_images = {}  # {method_name: PhotoImage}
         self.canvases = {}  # {method_name: canvas}
         self.scale_factor = 1.0
+        self.method_view_size_min = 180
+        self.method_view_size_max = 960
+        self.method_view_size = 320
+        self.method_view_size_var = tk.IntVar(value=self.method_view_size)
+        self.method_view_size_value_label = None
+        self.method_view_resize_job = None
         
         # 缩放级别
         self.zoom_level = 1.0  # 缩放倍数
         self.min_zoom = 0.1
-        self.max_zoom = 5.0
+        self.max_zoom = self.config.max_zoom
         
         # 平移偏移（用于拖动查看）
         self.pan_offset_x = 0
@@ -90,6 +96,93 @@ class MultiMethodCropperGUI:
                 }
             )
         return presets
+
+    def get_input_pattern_text(self):
+        return "\n".join(self.config.input_filename_patterns)
+
+    def get_input_pattern_summary(self):
+        return "、".join(self.config.input_filename_patterns)
+
+    def open_settings_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("设置")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        content = tk.Frame(dialog, padx=12, pady=12)
+        content.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(content, text="输入文件名模板", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        tk.Label(
+            content,
+            text="每行一个模板。使用 {number} 表示帧号，使用 * 表示任意文本。",
+            justify=tk.LEFT,
+            fg="gray",
+        ).pack(anchor=tk.W, pady=(4, 8))
+
+        pattern_text = tk.Text(content, width=42, height=8)
+        pattern_text.pack(fill=tk.BOTH, expand=True)
+        pattern_text.insert("1.0", self.get_input_pattern_text())
+
+        tk.Label(
+            content,
+            text="示例: frame{number}.exr\n示例: *.{number}.exr",
+            justify=tk.LEFT,
+            fg="gray",
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+        zoom_frame = tk.Frame(content)
+        zoom_frame.pack(fill=tk.X, pady=(12, 0))
+        tk.Label(zoom_frame, text="最大放大倍率", font=("Arial", 10, "bold")).pack(anchor=tk.W)
+        tk.Label(
+            zoom_frame,
+            text="滚轮缩放上限，默认 5.0。",
+            justify=tk.LEFT,
+            fg="gray",
+        ).pack(anchor=tk.W, pady=(4, 6))
+        max_zoom_var = tk.StringVar(value=f"{self.config.max_zoom:g}")
+        max_zoom_entry = tk.Entry(zoom_frame, width=12, textvariable=max_zoom_var)
+        max_zoom_entry.pack(anchor=tk.W)
+
+        def save_settings():
+            patterns = [line.strip() for line in pattern_text.get("1.0", tk.END).splitlines() if line.strip()]
+            if not patterns:
+                messagebox.showwarning("警告", "请至少保留一个输入文件名模板", parent=dialog)
+                return
+            if any("{number}" not in pattern for pattern in patterns):
+                messagebox.showwarning("警告", "每个模板都必须包含 {number} 占位符", parent=dialog)
+                return
+            try:
+                max_zoom = float(max_zoom_var.get().strip())
+            except ValueError:
+                messagebox.showwarning("警告", "最大放大倍率必须是数字", parent=dialog)
+                return
+            if max_zoom < 1.0:
+                messagebox.showwarning("警告", "最大放大倍率不能小于 1.0", parent=dialog)
+                return
+
+            self.config.save_input_filename_patterns(patterns)
+            self.config.save_max_zoom(max_zoom)
+            self.backend.update_input_filename_patterns(patterns)
+            self.max_zoom = self.config.max_zoom
+            if self.zoom_level > self.max_zoom:
+                self.zoom_level = self.max_zoom
+                for method in self.methods:
+                    if method in self.method_images:
+                        self.display_image_on_canvas(method)
+                self.redraw_all_rectangles()
+            self.status_label.config(text=f"输入模板和最大放大倍率已更新，当前上限 {self.max_zoom:g}x")
+
+            if self.input_sources:
+                self.scan_methods_and_frames()
+
+            dialog.destroy()
+
+        button_frame = tk.Frame(content)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+        tk.Button(button_frame, text="取消", command=dialog.destroy, width=10).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(button_frame, text="保存", command=save_settings, width=10).pack(side=tk.RIGHT)
 
     def create_remote_dialog(self, title, path_label, confirm_text, on_submit):
         presets = self.get_server_presets()
@@ -296,6 +389,8 @@ class MultiMethodCropperGUI:
         self.input_label.pack(side=tk.LEFT, padx=5)
         tk.Button(control_frame, text="清空输入", command=self.clear_input_folders,
                   bg="#9E9E9E", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(control_frame, text="设置", command=self.open_settings_dialog,
+              bg="#795548", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
         
         tk.Button(control_frame, text="选择输出文件夹", command=self.select_output_folder,
                   bg="#2196F3", fg="white", padx=10).pack(side=tk.LEFT, padx=20)
@@ -309,6 +404,25 @@ class MultiMethodCropperGUI:
         zoom_frame.pack(side=tk.LEFT, padx=20)
         tk.Label(zoom_frame, text="缩放(滚轮):").pack(side=tk.LEFT)
         tk.Button(zoom_frame, text="重置1:1", command=self.reset_zoom, bg="#FF9800", fg="white").pack(side=tk.LEFT, padx=5)
+
+        size_frame = tk.Frame(control_frame)
+        size_frame.pack(side=tk.LEFT, padx=10)
+        tk.Label(size_frame, text="预览大小:").pack(side=tk.LEFT)
+        size_scale = tk.Scale(
+            size_frame,
+            from_=self.method_view_size_min,
+            to=self.method_view_size_max,
+            orient=tk.HORIZONTAL,
+            resolution=20,
+            showvalue=False,
+            variable=self.method_view_size_var,
+            command=self.on_method_view_scale_changed,
+            length=180,
+        )
+        size_scale.pack(side=tk.LEFT, padx=(4, 6))
+        self.method_view_size_value_label = tk.Label(size_frame, width=7, anchor=tk.W)
+        self.method_view_size_value_label.pack(side=tk.LEFT)
+        self.update_method_view_size_label(self.method_view_size)
         
         # 主容器
         main_container = tk.Frame(self.root)
@@ -765,7 +879,8 @@ class MultiMethodCropperGUI:
         self.last_scan_errors = result.errors
         
         if not result.methods:
-            message = "未找到包含 frame*.exr 或 frame*.png 的本地/远程方法路径"
+            message = "未找到符合当前输入模板的本地/远程方法路径"
+            message += f"\n\n当前模板: {self.get_input_pattern_summary()}"
             if self.last_scan_errors:
                 message += "\n\n连接错误:\n" + "\n".join(self.last_scan_errors[:3])
             messagebox.showwarning("警告", message)
@@ -780,33 +895,14 @@ class MultiMethodCropperGUI:
         self.methods_listbox.delete(0, tk.END)
         for method in self.methods:
             self.methods_listbox.insert(tk.END, method)
-        
-        # 扫描帧号（从所有方法中合并）
-        frame_numbers = set()
-        methods_with_frames = []
-        
-        for method in self.methods:
-            method_source = self.method_sources[method]
-            method_path = self.method_paths[method]
-            
-            files = self.list_method_frame_files(method_source)
-            
-            if files:
-                methods_with_frames.append(method)
-                
-            # 提取帧号
-            for f in files:
-                basename = os.path.basename(f) if method_source["type"] == "local" else posixpath.basename(f)
-                match = re.search(r'frame(\d+)\.(exr|png)', basename, re.IGNORECASE)
-                if match:
-                    frame_numbers.add(match.group(1))
-        
-        self.frame_numbers = sorted(list(frame_numbers))
+        methods_with_frames = result.methods_with_frames
+        self.frame_numbers = result.frame_numbers
         
         if not self.frame_numbers:
             messagebox.showwarning(
                 "警告", 
-                f"在已选择的文件夹中都未找到 frame*.exr 或 frame*.png 文件\n"
+                f"在已选择的文件夹中都未找到符合当前模板的文件\n"
+                f"当前模板: {self.get_input_pattern_summary()}\n"
                 f"已扫描的方法: {', '.join(self.methods)}"
             )
             return
@@ -852,8 +948,10 @@ class MultiMethodCropperGUI:
         import gc
         gc.collect()
         
-        # 计算网格布局：每行最多显示的方法数
-        cols_per_row = (len(self.methods) + 1) // 2  # 向上取整，分成2行
+        target_width = self.method_view_size
+        target_height = self.method_view_size
+        available_width = max(self.scroll_canvas.winfo_width() - 40, target_width)
+        cols_per_row = max(1, min(len(self.methods), available_width // (target_width + 16)))
         
         # 为每个方法创建canvas
         for i, method in enumerate(self.methods):
@@ -862,8 +960,15 @@ class MultiMethodCropperGUI:
             col = i % cols_per_row   # 列号
             
             # 创建包含标签和canvas的Frame
-            method_frame = tk.Frame(self.scrollable_frame, bd=2, relief=tk.RIDGE)
+            method_frame = tk.Frame(
+                self.scrollable_frame,
+                bd=2,
+                relief=tk.RIDGE,
+                width=target_width + 12,
+                height=target_height + 44,
+            )
             method_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+            method_frame.grid_propagate(False)
             
             # 方法标签
             tk.Label(method_frame, text=method, font=("Arial", 11, "bold"), 
@@ -873,7 +978,7 @@ class MultiMethodCropperGUI:
             img_path = self.get_frame_image_entry(method, frame_num)
             
             if img_path is None:
-                tk.Label(method_frame, text=f"文件不存在: frame{frame_num}.(exr|png)", 
+                tk.Label(method_frame, text=f"文件不存在: 帧号 {frame_num}", 
                         fg="red").pack()
                 continue
             
@@ -884,8 +989,13 @@ class MultiMethodCropperGUI:
                 self.method_images[method] = img
                 
                 # 创建canvas
-                canvas = tk.Canvas(method_frame, bg="black", 
-                                 height=300, cursor="cross")  # 减小高度以适应两行布局
+                canvas = tk.Canvas(
+                    method_frame,
+                    bg="black",
+                    width=target_width,
+                    height=target_height,
+                    cursor="cross",
+                )
                 canvas.pack(fill=tk.BOTH, expand=True, pady=5)
                 self.canvases[method] = canvas
                 
@@ -909,7 +1019,8 @@ class MultiMethodCropperGUI:
         # 配置网格权重，使其能自动调整大小
         for c in range(cols_per_row):
             self.scrollable_frame.grid_columnconfigure(c, weight=1)
-        for r in range(2):
+        total_rows = (len(self.methods) + cols_per_row - 1) // cols_per_row
+        for r in range(total_rows):
             self.scrollable_frame.grid_rowconfigure(r, weight=1)
         
         # 更新帧信息
@@ -937,7 +1048,10 @@ class MultiMethodCropperGUI:
         
         # 如果canvas还没有尺寸，使用默认值
         if canvas_height <= 1:
-            canvas_height = 300
+            canvas_height = self.method_view_size
+
+        if canvas_width <= 1:
+            canvas_width = self.method_view_size
         
         if canvas_width <= 1:
             self.root.after(100, lambda: self.display_image_on_canvas(method))
@@ -969,6 +1083,29 @@ class MultiMethodCropperGUI:
         
         canvas.create_image(x_offset, y_offset, anchor=tk.NW, image=photo, tags="image")
         canvas.image_offset = (x_offset, y_offset)
+
+    def update_method_view_size_label(self, size_value):
+        if self.method_view_size_value_label is not None:
+            self.method_view_size_value_label.config(text=f"{size_value}px")
+
+    def on_method_view_scale_changed(self, value):
+        size_value = int(round(float(value)))
+        self.update_method_view_size_label(size_value)
+        if self.method_view_resize_job is not None:
+            self.root.after_cancel(self.method_view_resize_job)
+        self.method_view_resize_job = self.root.after(120, lambda: self.apply_method_view_size(size_value))
+
+    def apply_method_view_size(self, size_value):
+        self.method_view_resize_job = None
+        size_value = max(self.method_view_size_min, min(self.method_view_size_max, size_value))
+        if size_value == self.method_view_size:
+            return
+        self.method_view_size = size_value
+        if self.frame_numbers:
+            self.load_current_frame()
+        self.status_label.config(
+            text=f"预览大小已调整为 {self.method_view_size}px"
+        )
         
     def canvas_to_image_coords(self, canvas_x, canvas_y, method):
         """将画布坐标转换为原始图片坐标"""

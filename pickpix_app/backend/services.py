@@ -34,6 +34,50 @@ class ScanResult:
     errors: list[str]
 
 
+class InputFilenameMatcher:
+    def __init__(self, patterns: list[str] | None = None) -> None:
+        self.patterns: list[str] = []
+        self.compiled_patterns: list[re.Pattern[str]] = []
+        self.set_patterns(patterns or ["frame{number}.exr", "frame{number}.png"])
+
+    def set_patterns(self, patterns: list[str]) -> None:
+        self.patterns = [str(pattern).strip() for pattern in patterns if str(pattern).strip()]
+        if not self.patterns:
+            self.patterns = ["frame{number}.exr", "frame{number}.png"]
+        self.compiled_patterns = [self._compile_pattern(pattern) for pattern in self.patterns]
+
+    def _compile_pattern(self, pattern: str) -> re.Pattern[str]:
+        regex_parts: list[str] = []
+        index = 0
+
+        while index < len(pattern):
+            if pattern.startswith("{number}", index):
+                regex_parts.append(r"(?P<number>\d+)")
+                index += len("{number}")
+                continue
+            if pattern[index] == "*":
+                regex_parts.append(r".+?")
+                index += 1
+                continue
+
+            regex_parts.append(re.escape(pattern[index]))
+            index += 1
+
+        return re.compile("^" + "".join(regex_parts) + "$", re.IGNORECASE)
+
+    def parse_file_name(self, file_name: str) -> tuple[str, str] | None:
+        for pattern in self.compiled_patterns:
+            match = pattern.match(file_name)
+            if match:
+                frame_number = match.group("number")
+                extension = os.path.splitext(file_name)[1].lstrip(".").lower()
+                return frame_number, extension
+        return None
+
+    def matches(self, file_name: str) -> bool:
+        return self.parse_file_name(file_name) is not None
+
+
 class RemoteStorageService:
     def __init__(self) -> None:
         self.remote_clients: dict[tuple[str, int, str, str], dict[str, object]] = {}
@@ -176,21 +220,25 @@ class ImageService:
 
 
 class ScanService:
-    def __init__(self, storage: RemoteStorageService) -> None:
+    def __init__(self, storage: RemoteStorageService, matcher: InputFilenameMatcher) -> None:
         self.storage = storage
+        self.matcher = matcher
 
     def local_folder_has_frames(self, folder_path: str) -> bool:
-        for ext in ["exr", "png"]:
-            if glob.glob(os.path.join(folder_path, f"frame*.{ext}")):
-                return True
-        return False
+        try:
+            return any(
+                os.path.isfile(os.path.join(folder_path, name)) and self.matcher.matches(name)
+                for name in os.listdir(folder_path)
+            )
+        except OSError:
+            return False
 
     def list_remote_entries(self, source: SourceConfig) -> list[str]:
         sftp = self.storage.get_sftp_client(source)
         return sftp.listdir(str(source["path"]))
 
     def remote_folder_has_frames(self, source: SourceConfig) -> bool:
-        return any(re.match(r"frame\d+\.(exr|png)$", name, re.IGNORECASE) for name in self.list_remote_entries(source))
+        return any(self.matcher.matches(name) for name in self.list_remote_entries(source))
 
     def remote_is_dir(self, source: SourceConfig) -> bool:
         sftp = self.storage.get_sftp_client(source)
@@ -294,15 +342,19 @@ class ScanService:
 
     def list_method_frame_files(self, source: SourceConfig) -> list[str]:
         if source["type"] == "local":
-            files: list[str] = []
-            for ext in ["exr", "png"]:
-                files.extend(glob.glob(os.path.join(str(source["path"]), f"frame*.{ext}")))
-            return files
+            try:
+                return sorted(
+                    os.path.join(str(source["path"]), name)
+                    for name in os.listdir(str(source["path"]))
+                    if os.path.isfile(os.path.join(str(source["path"]), name)) and self.matcher.matches(name)
+                )
+            except OSError:
+                return []
 
         return [
             posixpath.join(str(source["path"]), name)
             for name in self.list_remote_entries(source)
-            if re.match(r"frame\d+\.(exr|png)$", name, re.IGNORECASE)
+            if self.matcher.matches(name)
         ]
 
     def scan(self, input_sources: list[SourceConfig]) -> ScanResult:
@@ -329,9 +381,9 @@ class ScanService:
                 methods_with_frames.append(method)
             for file_path in files:
                 basename = os.path.basename(file_path) if source["type"] == "local" else posixpath.basename(file_path)
-                match = re.search(r"frame(\d+)\.(exr|png)", basename, re.IGNORECASE)
-                if match:
-                    frame_numbers.add(match.group(1))
+                matched = self.matcher.parse_file_name(basename)
+                if matched:
+                    frame_numbers.add(matched[0])
 
         return ScanResult(
             methods=methods,
@@ -614,11 +666,15 @@ class CropService:
 
 
 class PickPixBackend:
-    def __init__(self) -> None:
+    def __init__(self, input_filename_patterns: list[str] | None = None) -> None:
         self.storage = RemoteStorageService()
         self.image = ImageService()
-        self.scan = ScanService(self.storage)
+        self.matcher = InputFilenameMatcher(input_filename_patterns)
+        self.scan = ScanService(self.storage, self.matcher)
         self.crop = CropService(self.storage)
+
+    def update_input_filename_patterns(self, patterns: list[str]) -> None:
+        self.matcher.set_patterns(patterns)
 
     @property
     def is_remote_available(self) -> bool:
@@ -637,24 +693,21 @@ class PickPixBackend:
         if not source:
             return None
 
-        if source["type"] == "local":
-            for ext in ["exr", "png"]:
-                test_path = os.path.join(str(source["path"]), f"frame{frame_num}.{ext}")
-                if os.path.exists(test_path):
-                    return test_path
-            return None
+        files = self.scan.list_method_frame_files(source)
+        preferred_matches: dict[str, str] = {}
 
-        try:
-            names = self.scan.list_remote_entries(source)
-        except Exception:
-            return None
+        for file_path in files:
+            file_name = os.path.basename(file_path) if source["type"] == "local" else posixpath.basename(file_path)
+            matched = self.matcher.parse_file_name(file_name)
+            if not matched or matched[0] != frame_num:
+                continue
+            preferred_matches.setdefault(matched[1], file_path)
 
-        for ext in ["exr", "png"]:
-            target_name = f"frame{frame_num}.{ext}".lower()
-            for name in names:
-                if name.lower() == target_name:
-                    return posixpath.join(str(source["path"]), name)
-        return None
+        for extension in ["exr", "png"]:
+            if extension in preferred_matches:
+                return preferred_matches[extension]
+
+        return next(iter(preferred_matches.values()), None)
 
     def load_method_frame_image(
         self,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "app": {
         "title": "PickPix Multi Method Cropper",
         "geometry": "1600x1000",
+        "max_zoom": 5.0,
+    },
+    "input": {
+        "filename_patterns": [
+            "frame{number}.exr",
+            "frame{number}.png",
+            "*.{number}.exr",
+            "*.{number}.png",
+        ],
     },
     "servers": {
         "server_1": {
@@ -70,6 +81,13 @@ def _simple_yaml_load(text: str) -> dict[str, Any]:
             parsed_value.startswith("'") and parsed_value.endswith("'")
         ):
             parsed_value = parsed_value[1:-1]
+        elif parsed_value.startswith("[") and parsed_value.endswith("]"):
+            try:
+                literal = ast.literal_eval(parsed_value)
+                if isinstance(literal, list):
+                    parsed_value = literal
+            except (SyntaxError, ValueError):
+                pass
 
         current[key] = parsed_value
 
@@ -83,6 +101,8 @@ def _simple_yaml_dump(data: dict[str, Any], indent: int = 0) -> str:
         if isinstance(value, dict):
             lines.append(f"{prefix}{key}:")
             lines.append(_simple_yaml_dump(value, indent + 2).rstrip("\n"))
+        elif isinstance(value, list):
+            lines.append(f"{prefix}{key}: {value}")
         else:
             lines.append(f"{prefix}{key}: {value}")
     return "\n".join(lines) + "\n"
@@ -100,11 +120,16 @@ def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 class AppConfig:
     def __init__(self, config_path: str | Path | None = None) -> None:
-        self.project_root = Path(__file__).resolve().parent.parent
+        self.project_root = self._resolve_runtime_root()
         self.config_path = Path(config_path) if config_path else self.project_root / "config" / "paths.yaml"
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_default_config()
         self.data = self._load()
+
+    def _resolve_runtime_root(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent.parent
 
     def _ensure_default_config(self) -> None:
         if self.config_path.exists():
@@ -132,10 +157,73 @@ class AppConfig:
     def geometry(self) -> str:
         return str(self.data["app"]["geometry"])
 
+    @staticmethod
+    def _normalize_max_zoom(value: Any) -> float:
+        try:
+            max_zoom = float(value)
+        except (TypeError, ValueError):
+            max_zoom = float(DEFAULT_CONFIG["app"]["max_zoom"])
+        return max(1.0, max_zoom)
+
+    @staticmethod
+    def _normalize_input_patterns(patterns: Any) -> list[str]:
+        if isinstance(patterns, str):
+            values = patterns.splitlines()
+        elif isinstance(patterns, list):
+            values = patterns
+        else:
+            values = []
+
+        normalized: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if text:
+                normalized.append(text)
+
+        return normalized or list(DEFAULT_CONFIG["input"]["filename_patterns"])
+
+    def _write(self) -> None:
+        if yaml is not None:
+            content = yaml.safe_dump(self.data, sort_keys=False, allow_unicode=True)
+        else:
+            content = _simple_yaml_dump(self.data)
+        self.config_path.write_text(content, encoding="utf-8")
+
     @property
     def server_presets(self) -> dict[str, dict[str, Any]]:
         presets = self.data.get("servers", {})
         return presets if isinstance(presets, dict) else {}
+
+    @property
+    def input_filename_patterns(self) -> list[str]:
+        input_config = self.data.get("input", {})
+        if not isinstance(input_config, dict):
+            return list(DEFAULT_CONFIG["input"]["filename_patterns"])
+        return self._normalize_input_patterns(input_config.get("filename_patterns"))
+
+    def save_input_filename_patterns(self, patterns: list[str]) -> None:
+        normalized = self._normalize_input_patterns(patterns)
+        input_config = self.data.setdefault("input", {})
+        if not isinstance(input_config, dict):
+            input_config = {}
+            self.data["input"] = input_config
+        input_config["filename_patterns"] = normalized
+        self._write()
+
+    @property
+    def max_zoom(self) -> float:
+        app_config = self.data.get("app", {})
+        if not isinstance(app_config, dict):
+            return float(DEFAULT_CONFIG["app"]["max_zoom"])
+        return self._normalize_max_zoom(app_config.get("max_zoom"))
+
+    def save_max_zoom(self, max_zoom: float) -> None:
+        app_config = self.data.setdefault("app", {})
+        if not isinstance(app_config, dict):
+            app_config = {}
+            self.data["app"] = app_config
+        app_config["max_zoom"] = self._normalize_max_zoom(max_zoom)
+        self._write()
 
     def resolve_path(self, key: str) -> Path:
         relative = Path(self.data["paths"][key])
