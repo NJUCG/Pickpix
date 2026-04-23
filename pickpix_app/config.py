@@ -143,11 +143,30 @@ class AppConfig:
     def _load(self) -> dict[str, Any]:
         raw: dict[str, Any] = {}
         if self.config_path.exists():
-            text = self.config_path.read_text(encoding="utf-8")
-            loaded = yaml.safe_load(text) if yaml is not None else _simple_yaml_load(text)
+            loaded = self.load_yaml_file(self.config_path)
             if isinstance(loaded, dict):
                 raw = loaded
         return _merge_dict(DEFAULT_CONFIG, raw)
+
+    @staticmethod
+    def load_yaml_file(file_path: str | Path) -> dict[str, Any]:
+        path = Path(file_path)
+        if not path.exists():
+            return {}
+
+        text = path.read_text(encoding="utf-8")
+        loaded = yaml.safe_load(text) if yaml is not None else _simple_yaml_load(text)
+        return loaded if isinstance(loaded, dict) else {}
+
+    @staticmethod
+    def save_yaml_file(file_path: str | Path, data: dict[str, Any]) -> None:
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if yaml is not None:
+            content = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        else:
+            content = _simple_yaml_dump(data)
+        path.write_text(content, encoding="utf-8")
 
     @property
     def title(self) -> str:
@@ -183,11 +202,7 @@ class AppConfig:
         return normalized or list(DEFAULT_CONFIG["input"]["filename_patterns"])
 
     def _write(self) -> None:
-        if yaml is not None:
-            content = yaml.safe_dump(self.data, sort_keys=False, allow_unicode=True)
-        else:
-            content = _simple_yaml_dump(self.data)
-        self.config_path.write_text(content, encoding="utf-8")
+        self.save_yaml_file(self.config_path, self.data)
 
     @property
     def server_presets(self) -> dict[str, dict[str, Any]]:

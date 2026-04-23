@@ -436,6 +436,17 @@ class CropService:
             draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
         return vis_img
 
+    def create_absolute_error_map_image(self, base_img: Image.Image, compare_img: Image.Image) -> Image.Image:
+        if base_img.size != compare_img.size:
+            raise ValueError(
+                f"image size mismatch: {base_img.width}x{base_img.height} vs {compare_img.width}x{compare_img.height}"
+            )
+
+        base_array = np.asarray(base_img.convert("RGB"), dtype=np.int16)
+        compare_array = np.asarray(compare_img.convert("RGB"), dtype=np.int16)
+        diff_array = np.abs(base_array - compare_array).astype(np.uint8)
+        return Image.fromarray(diff_array, mode="RGB")
+
     def resize_for_collage(self, img: Image.Image, max_width: int, max_height: int) -> Image.Image:
         copy_img = img.copy()
         copy_img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)

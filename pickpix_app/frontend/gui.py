@@ -32,18 +32,33 @@ class MultiMethodCropperGUI:
         self.output_target = None
         self.methods = []  # 子文件夹列表（方法名）
         self.all_methods = []  # 扫描得到的全部方法名
+        self.scanned_methods = []
+        self.method_entries = {}  # {method_name: {type, source/path or parents, origin}}
         self.method_paths = {}  # {method_name: folder_path}
         self.method_sources = {}  # {method_name: source_config}
         self.methods_with_frames = []
         self.method_filter_vars = {}
+        self.method_offset_vars = {}
+        self.method_ui_defaults = {}
         self.methods_summary_label = None
+        self.method_filter_apply_button = None
         self.method_filter_canvas = None
         self.method_filter_content = None
         self.method_filter_canvas_window = None
         self.method_filter_scrollbar = None
+        self.method_filter_pending_changes = False
+        self.is_updating_method_filter_controls = False
         self.last_scan_errors = []
         self.frame_numbers = []  # 帧号列表
         self.current_frame_index = 0
+        self.workspace_file_path = None
+        self.workspace_dirty = False
+        self.workspace_label = None
+        self.is_restoring_workspace = False
+        self.bookmarked_frames = set()
+        self.bookmark_toggle_button = None
+        self.bookmark_combo = None
+        self.bookmark_values = []
         
         # 每个方法的图片数据
         self.method_images = {}  # {method_name: {frame: PIL.Image}}
@@ -110,6 +125,424 @@ class MultiMethodCropperGUI:
 
     def get_input_pattern_summary(self):
         return "、".join(self.config.input_filename_patterns)
+
+    def set_workspace_file_path(self, file_path):
+        self.workspace_file_path = file_path
+        self.update_workspace_label()
+
+    def update_workspace_label(self):
+        if self.workspace_label is None:
+            return
+
+        if self.workspace_file_path:
+            file_name = os.path.basename(self.workspace_file_path)
+            prefix = "* " if self.workspace_dirty else ""
+            self.workspace_label.config(text=f"工程: {prefix}{self.shorten_text(file_name, 36)}", fg="black")
+        else:
+            prefix = "* " if self.workspace_dirty else ""
+            self.workspace_label.config(text=f"工程: {prefix}未保存", fg="gray")
+
+    def mark_workspace_dirty(self):
+        if self.is_restoring_workspace:
+            return
+        self.workspace_dirty = True
+        self.update_workspace_label()
+
+    def mark_workspace_clean(self):
+        self.workspace_dirty = False
+        self.update_workspace_label()
+
+    def copy_mapping(self, data):
+        return dict(data) if isinstance(data, dict) else {}
+
+    def get_current_frame_num(self):
+        if not self.frame_numbers:
+            return None
+        if self.current_frame_index < 0 or self.current_frame_index >= len(self.frame_numbers):
+            return None
+        return self.frame_numbers[self.current_frame_index]
+
+    def get_workspace_methods_state(self):
+        method_states = []
+        for method in self.all_methods:
+            entry = self.get_method_entry(method)
+            if not entry:
+                continue
+            method_states.append(
+                {
+                    "name": method,
+                    "entry": self.serialize_method_entry(entry),
+                    "selected": bool(self.method_filter_vars.get(method).get()) if method in self.method_filter_vars else method in self.methods,
+                    "offset": self.get_method_frame_offset(method),
+                }
+            )
+        return method_states
+
+    def serialize_method_entry(self, entry):
+        if entry.get("type") == "errormap":
+            return {
+                "type": "errormap",
+                "origin": entry.get("origin", "errormap"),
+                "parents": list(entry.get("parents", ())),
+            }
+
+        return {
+            "type": "source",
+            "origin": entry.get("origin", "scan"),
+            "path": str(entry.get("path", "")),
+            "source": self.copy_mapping(entry.get("source", {})),
+        }
+
+    def build_workspace_data(self):
+        return {
+            "workspace": {
+                "version": 1,
+                "input_sources": [self.copy_mapping(source) for source in self.input_sources],
+                "output_target": self.copy_mapping(self.output_target),
+                "current_frame": self.get_current_frame_num(),
+                "methods": self.get_workspace_methods_state(),
+                "crop_boxes": [list(box) for box in self.crop_boxes],
+                "bookmarked_frames": list(self.bookmarked_frames),
+                "method_view_size": int(self.method_view_size),
+                "zoom_level": float(self.zoom_level),
+                "pan_offset_x": int(self.pan_offset_x),
+                "pan_offset_y": int(self.pan_offset_y),
+            }
+        }
+
+    def normalize_workspace_data(self, data):
+        workspace = data.get("workspace", {}) if isinstance(data, dict) else {}
+        if not isinstance(workspace, dict):
+            workspace = {}
+        version = workspace.get("version", 1)
+        if version != 1:
+            raise ValueError(f"不支持的工程文件版本: {version}")
+        return workspace
+
+    def ask_workspace_save_path(self):
+        return filedialog.asksaveasfilename(
+            title="保存工程文件",
+            defaultextension=".pickpix-workspace.yaml",
+            filetypes=[("PickPix 工程", "*.pickpix-workspace.yaml"), ("YAML 文件", "*.yaml"), ("所有文件", "*.*")],
+        )
+
+    def save_workspace_to_path(self, file_path):
+        try:
+            self.config.save_yaml_file(file_path, self.build_workspace_data())
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"无法保存工程文件:\n{exc}")
+            return False
+
+        self.set_workspace_file_path(file_path)
+        self.mark_workspace_clean()
+        self.status_label.config(text=f"工程已保存: {os.path.basename(file_path)}")
+        return True
+
+    def save_workspace(self):
+        if not self.workspace_file_path:
+            return self.save_workspace_as()
+        return self.save_workspace_to_path(self.workspace_file_path)
+
+    def save_workspace_as(self):
+        file_path = self.ask_workspace_save_path()
+        if not file_path:
+            return False
+        return self.save_workspace_to_path(file_path)
+
+    def ask_workspace_open_path(self):
+        return filedialog.askopenfilename(
+            title="导入工程文件",
+            filetypes=[("PickPix 工程", "*.pickpix-workspace.yaml"), ("YAML 文件", "*.yaml"), ("所有文件", "*.*")],
+        )
+
+    def load_workspace(self):
+        if not self.prompt_save_workspace_if_dirty("导入其他工程"):
+            return False
+        file_path = self.ask_workspace_open_path()
+        if not file_path:
+            return False
+        return self.load_workspace_from_path(file_path)
+
+    def load_workspace_from_path(self, file_path):
+        try:
+            data = self.config.load_yaml_file(file_path)
+            workspace = self.normalize_workspace_data(data)
+            return self.apply_workspace_data(workspace, file_path)
+        except Exception as exc:
+            messagebox.showerror("导入失败", f"无法导入工程文件:\n{exc}")
+            return False
+
+    def apply_workspace_data(self, workspace, file_path):
+        warnings = []
+        saved_methods = workspace.get("methods", [])
+        if not isinstance(saved_methods, list):
+            saved_methods = []
+
+        self.is_restoring_workspace = True
+        try:
+            self.clear_workspace_state(clear_output=True, preserve_workspace_path=False)
+
+            self.input_sources = [self.copy_mapping(source) for source in workspace.get("input_sources", []) if isinstance(source, dict)]
+            self.input_folders = [str(source.get("path", "")) for source in self.input_sources if source.get("type") == "local"]
+            self.input_folder = self.input_folders[0] if self.input_folders else ""
+
+            output_target = workspace.get("output_target", {})
+            if isinstance(output_target, dict) and output_target:
+                self.output_target = self.copy_mapping(output_target)
+                self.output_folder = str(self.output_target.get("path", self.output_folder))
+            else:
+                self.output_target = None
+                self.output_folder = str(self.config.default_output_dir)
+            self.update_output_label()
+
+            method_view_size = int(workspace.get("method_view_size", self.method_view_size))
+            method_view_size = max(self.method_view_size_min, min(self.method_view_size_max, method_view_size))
+            self.method_view_size = method_view_size
+            self.method_view_size_var.set(method_view_size)
+            self.update_method_view_size_label(method_view_size)
+
+            self.zoom_level = float(workspace.get("zoom_level", 1.0))
+            self.zoom_level = max(self.min_zoom, min(self.max_zoom, self.zoom_level))
+            self.pan_offset_x = int(workspace.get("pan_offset_x", 0))
+            self.pan_offset_y = int(workspace.get("pan_offset_y", 0))
+
+            if self.input_sources:
+                result = self.backend.scan.scan(self.input_sources)
+                self.last_scan_errors = result.errors
+                self.scanned_methods = list(result.methods)
+                scanned_entry_map = {
+                    method: self.build_source_method_entry(result.method_sources[method], result.method_paths[method], origin="scan")
+                    for method in result.methods
+                }
+
+                self.method_entries = {}
+                self.all_methods = []
+                saved_method_state_map = {}
+
+                for item in saved_methods:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    entry_data = item.get("entry", {})
+                    if not name or not isinstance(entry_data, dict):
+                        continue
+                    saved_method_state_map[name] = item
+
+                    entry_type = entry_data.get("type", "source")
+                    origin = str(entry_data.get("origin", "scan"))
+                    if entry_type == "source" and origin == "scan":
+                        if name in scanned_entry_map:
+                            self.method_entries[name] = scanned_entry_map[name]
+                            self.all_methods.append(name)
+                        else:
+                            warnings.append(f"方法 {name} 已不存在，已跳过")
+                    elif entry_type == "source":
+                        source = entry_data.get("source", {})
+                        self.method_entries[name] = self.build_source_method_entry(source, entry_data.get("path", ""), origin=origin)
+                        self.all_methods.append(name)
+                    elif entry_type == "errormap":
+                        parents = entry_data.get("parents", [])
+                        if not isinstance(parents, list) or len(parents) != 2:
+                            warnings.append(f"差分方法 {name} 缺少有效来源，已跳过")
+                            continue
+                        self.method_entries[name] = self.build_errormap_method_entry(str(parents[0]), str(parents[1]), origin=origin)
+                        self.all_methods.append(name)
+
+                if not self.all_methods:
+                    self.method_entries = dict(scanned_entry_map)
+                    self.all_methods = list(result.methods)
+                    saved_method_state_map = {}
+
+                valid_method_names = set(self.method_entries.keys())
+                for method in list(self.all_methods):
+                    entry = self.method_entries.get(method)
+                    if not entry or entry.get("type") != "errormap":
+                        continue
+                    parents = entry.get("parents", ())
+                    if any(parent not in valid_method_names for parent in parents):
+                        self.all_methods.remove(method)
+                        self.method_entries.pop(method, None)
+                        warnings.append(f"差分方法 {method} 的来源方法缺失，已跳过")
+
+                self.methods = list(self.all_methods)
+                self.rebuild_method_source_maps()
+                self.methods_with_frames = result.methods_with_frames
+                self.frame_numbers = result.frame_numbers
+                self.method_ui_defaults = {}
+                for method in self.all_methods:
+                    state = saved_method_state_map.get(method, {})
+                    self.method_ui_defaults[method] = {
+                        "selected": bool(state.get("selected", True)),
+                        "offset": str(state.get("offset", 0)),
+                    }
+
+                self.rebuild_method_filter_ui()
+                self.refresh_visible_methods(reload_frame=False)
+
+                self.input_label.config(text=f"已打开 {len(self.input_sources)} 个输入", fg="black")
+                current_frame = str(workspace.get("current_frame", "")).strip()
+                if self.frame_numbers:
+                    if current_frame and current_frame in self.frame_numbers:
+                        self.current_frame_index = self.frame_numbers.index(current_frame)
+                    else:
+                        self.current_frame_index = 0
+                        if current_frame:
+                            warnings.append(f"保存的帧 {current_frame} 不存在，已回退到首帧")
+                    self.load_current_frame()
+                else:
+                    self.frame_info_label.config(text="帧: 0 / 0")
+            else:
+                self.input_label.config(text="未选择文件夹", fg="gray")
+
+            crop_boxes = []
+            for box in workspace.get("crop_boxes", []):
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    crop_boxes.append(tuple(int(value) for value in box))
+            self.crop_boxes = crop_boxes
+            self.rebuild_crop_boxes_list()
+            if self.canvases:
+                self.redraw_all_rectangles()
+
+            restored_bookmarks = set()
+            for frame in workspace.get("bookmarked_frames", []):
+                frame_text = str(frame).strip()
+                if not frame_text:
+                    continue
+                if self.frame_numbers and frame_text not in self.frame_numbers:
+                    warnings.append(f"书签帧 {frame_text} 不存在，已跳过")
+                    continue
+                restored_bookmarks.add(frame_text)
+            self.bookmarked_frames = restored_bookmarks
+            self.update_bookmark_controls()
+
+            self.set_workspace_file_path(file_path)
+            self.mark_workspace_clean()
+            if warnings:
+                messagebox.showwarning("导入工程完成", "\n".join(warnings[:10]))
+            self.status_label.config(text=f"已导入工程: {os.path.basename(file_path)}")
+            return True
+        finally:
+            self.is_restoring_workspace = False
+
+    def prompt_save_workspace_if_dirty(self, action_name="继续"): 
+        if not self.workspace_dirty:
+            return True
+
+        result = messagebox.askyesnocancel(
+            "未保存的工程",
+            f"当前工程有未保存的修改，是否在{action_name}前先保存？",
+        )
+        if result is None:
+            return False
+        if result:
+            return self.save_workspace()
+        return True
+
+    def update_output_label(self):
+        if self.output_target:
+            if self.output_target.get("type") == "local":
+                text = os.path.basename(self.output_target.get("path", "")) or str(self.output_target.get("path", ""))
+            else:
+                server_name = self.output_target.get("server_label", self.output_target.get("host", ""))
+                text = f"{server_name}:{self.output_target.get('path', '')}"
+            self.output_label.config(text=text, fg="black")
+        else:
+            self.output_label.config(text="未选择文件夹", fg="gray")
+
+    def rebuild_crop_boxes_list(self):
+        self.boxes_listbox.delete(0, tk.END)
+        for index, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
+            self.boxes_listbox.insert(tk.END, f"框{index}: ({x1}, {y1}) -> ({x2}, {y2}) [{x2-x1}×{y2-y1}]")
+
+    def get_sorted_bookmarks(self):
+        frame_order = {frame: index for index, frame in enumerate(self.frame_numbers)}
+        return sorted(self.bookmarked_frames, key=lambda frame: frame_order.get(frame, len(frame_order)))
+
+    def update_bookmark_controls(self):
+        current_frame = self.get_current_frame_num()
+        is_bookmarked = current_frame in self.bookmarked_frames if current_frame else False
+
+        if self.bookmark_toggle_button is not None:
+            self.bookmark_toggle_button.config(text="取消收藏" if is_bookmarked else "收藏当前帧")
+
+        self.bookmark_values = self.get_sorted_bookmarks()
+        if self.bookmark_combo is not None:
+            self.bookmark_combo.configure(values=self.bookmark_values)
+            if current_frame in self.bookmarked_frames:
+                self.bookmark_combo.set(current_frame)
+            elif self.bookmark_values:
+                self.bookmark_combo.set(self.bookmark_values[0])
+            elif not self.bookmark_values:
+                self.bookmark_combo.set("")
+
+    def set_current_frame_by_num(self, frame_num, clear_boxes=True):
+        if frame_num not in self.frame_numbers:
+            return False
+        if clear_boxes:
+            self.clear_all_boxes()
+        self.current_frame_index = self.frame_numbers.index(frame_num)
+        self.load_current_frame()
+        self.mark_workspace_dirty()
+        return True
+
+    def get_mousewheel_delta(self, event):
+        if hasattr(event, "delta") and event.delta:
+            return -1 if event.delta > 0 else 1
+        if getattr(event, "num", None) in (4, 5):
+            return -1 if event.num == 4 else 1
+        return 0
+
+    def widget_is_descendant(self, widget, ancestor):
+        while widget is not None:
+            if widget == ancestor:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def scroll_preview_canvas(self, event):
+        delta = self.get_mousewheel_delta(event)
+        if delta:
+            self.scroll_canvas.yview_scroll(delta, "units")
+            return "break"
+        return None
+
+    def jump_to_bookmark(self):
+        frame_num = self.bookmark_combo.get().strip() if self.bookmark_combo is not None else ""
+        if not frame_num:
+            return
+        if not self.set_current_frame_by_num(frame_num):
+            messagebox.showwarning("警告", f"书签帧 {frame_num} 不存在")
+
+    def toggle_current_bookmark(self):
+        frame_num = self.get_current_frame_num()
+        if frame_num is None:
+            return
+
+        if frame_num in self.bookmarked_frames:
+            self.bookmarked_frames.remove(frame_num)
+            self.status_label.config(text=f"已取消收藏帧 {frame_num}")
+        else:
+            self.bookmarked_frames.add(frame_num)
+            self.status_label.config(text=f"已收藏帧 {frame_num}")
+
+        self.mark_workspace_dirty()
+        self.update_bookmark_controls()
+
+    def jump_relative_bookmark(self, direction):
+        current_frame = self.get_current_frame_num()
+        if current_frame is None:
+            return
+        bookmarks = self.get_sorted_bookmarks()
+        if not bookmarks:
+            messagebox.showinfo("提示", "当前没有收藏的帧")
+            return
+
+        if current_frame in bookmarks:
+            current_index = bookmarks.index(current_frame)
+            target_index = (current_index + direction) % len(bookmarks)
+        else:
+            target_index = 0 if direction > 0 else len(bookmarks) - 1
+        self.set_current_frame_by_num(bookmarks[target_index])
 
     def open_settings_dialog(self):
         dialog = tk.Toplevel(self.root)
@@ -349,27 +782,31 @@ class MultiMethodCropperGUI:
             raise ValueError(f"不支持的图片格式: {ext}")
     
     def _on_mousewheel(self, event):
-        """处理鼠标滚轮事件 - 缩放图片"""
-        if not self.method_images:
-            return
-        
-        # 计算缩放因子
-        zoom_factor = 1.1 if event.delta > 0 else 0.9
-        new_zoom = self.zoom_level * zoom_factor
-        
-        # 限制缩放范围
-        new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
-        
-        if new_zoom != self.zoom_level:
-            self.zoom_level = new_zoom
-            # 重新显示所有图片
-            for method in self.methods:
-                if method in self.method_images:
-                    self.display_image_on_canvas(method)
-            # 重绘裁剪框
-            self.redraw_all_rectangles()
-            # 更新状态显示
-            self.status_label.config(text=f"缩放: {self.zoom_level:.1f}x")
+        """处理鼠标滚轮事件：默认滚动，Ctrl + 滚轮缩放图片。"""
+        hovered_widget = self.root.winfo_containing(event.x_root, event.y_root)
+        if hovered_widget is None:
+            return None
+
+        if self.method_filter_canvas is not None and self.widget_is_descendant(hovered_widget, self.method_filter_canvas):
+            return self.on_method_filter_mousewheel(event)
+
+        if self.scroll_canvas is not None and self.widget_is_descendant(hovered_widget, self.scroll_canvas):
+            if event.state & 0x0004 and self.method_images:
+                zoom_factor = 1.1 if self.get_mousewheel_delta(event) < 0 else 0.9
+                new_zoom = self.zoom_level * zoom_factor
+                new_zoom = max(self.min_zoom, min(self.max_zoom, new_zoom))
+
+                if new_zoom != self.zoom_level:
+                    self.zoom_level = new_zoom
+                    for method in self.methods:
+                        if method in self.method_images:
+                            self.display_image_on_canvas(method)
+                    self.redraw_all_rectangles()
+                    self.status_label.config(text=f"缩放: {self.zoom_level:.1f}x")
+                return "break"
+            return self.scroll_preview_canvas(event)
+
+        return None
     
     def reset_zoom(self):
         """重置缩放到1:1并居中"""
@@ -400,6 +837,241 @@ class MultiMethodCropperGUI:
             return "break"
         return None
 
+    def get_method_entry(self, method):
+        return self.method_entries.get(method)
+
+    def is_source_method(self, method):
+        entry = self.get_method_entry(method)
+        return bool(entry) and entry.get("type") == "source"
+
+    def shorten_text(self, text, max_chars):
+        text = str(text)
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        if max_chars <= 3:
+            return text[:max_chars]
+        return text[: max_chars - 3] + "..."
+
+    def get_method_list_label(self, method):
+        entry = self.get_method_entry(method) or {}
+        tags = []
+        if entry.get("origin") == "clone":
+            tags.append("克隆")
+        if entry.get("type") == "errormap":
+            tags.append("差分")
+        if not tags:
+            return self.shorten_text(method, 24)
+        return self.shorten_text(f"{method} [{' / '.join(tags)}]", 24)
+
+    def make_unique_session_method_name(self, base_name):
+        candidate = str(base_name).strip() or "method"
+        if candidate not in self.all_methods:
+            return candidate
+
+        index = 2
+        while True:
+            candidate_with_index = f"{candidate}_{index}"
+            if candidate_with_index not in self.all_methods:
+                return candidate_with_index
+            index += 1
+
+    def build_source_method_entry(self, source, method_path, origin="scan"):
+        return {
+            "type": "source",
+            "origin": origin,
+            "source": dict(source),
+            "path": str(method_path),
+        }
+
+    def build_errormap_method_entry(self, method_a, method_b, origin="errormap"):
+        return {
+            "type": "errormap",
+            "origin": origin,
+            "parents": (method_a, method_b),
+        }
+
+    def rebuild_method_source_maps(self):
+        self.method_paths = {}
+        self.method_sources = {}
+        for method in self.all_methods:
+            entry = self.method_entries.get(method)
+            if not entry or entry.get("type") != "source":
+                continue
+            self.method_paths[method] = str(entry.get("path", ""))
+            source = entry.get("source")
+            if source:
+                self.method_sources[method] = dict(source)
+
+    def remember_new_method_ui_state(self, method, selected=True, offset="0"):
+        self.method_ui_defaults[method] = {
+            "selected": selected,
+            "offset": str(offset),
+        }
+
+    def add_method_entry(self, method_name, entry, *, selected=True, offset="0"):
+        self.method_entries[method_name] = entry
+        self.all_methods.append(method_name)
+        self.remember_new_method_ui_state(method_name, selected=selected, offset=offset)
+        self.rebuild_method_source_maps()
+
+    def clone_method(self, method):
+        entry = self.get_method_entry(method)
+        if not entry:
+            return
+
+        clone_name = self.make_unique_session_method_name(f"{method}_clone")
+        offset_var = self.method_offset_vars.get(method)
+        offset_value = offset_var.get().strip() if offset_var is not None else "0"
+
+        if entry.get("type") == "source":
+            clone_entry = self.build_source_method_entry(entry.get("source", {}), entry.get("path", ""), origin="clone")
+        else:
+            parent_a, parent_b = entry.get("parents", (None, None))
+            if not parent_a or not parent_b:
+                messagebox.showwarning("警告", f"方法 {method} 没有可克隆的差分来源")
+                return
+            clone_entry = self.build_errormap_method_entry(parent_a, parent_b, origin="clone")
+
+        selected = self.method_filter_vars.get(method).get() if method in self.method_filter_vars else True
+        self.add_method_entry(clone_name, clone_entry, selected=selected, offset=offset_value or "0")
+        self.rebuild_method_filter_ui()
+        self.refresh_visible_methods(reload_frame=bool(self.frame_numbers))
+        self.mark_workspace_dirty()
+        self.status_label.config(text=f"已克隆方法: {method} -> {clone_name}")
+
+    def collect_dependent_methods(self, root_method):
+        to_remove = {root_method}
+        changed = True
+        while changed:
+            changed = False
+            for method, entry in self.method_entries.items():
+                if method in to_remove or entry.get("type") != "errormap":
+                    continue
+                parents = entry.get("parents", ())
+                if any(parent in to_remove for parent in parents):
+                    to_remove.add(method)
+                    changed = True
+        return [method for method in self.all_methods if method in to_remove]
+
+    def remove_method(self, method):
+        if method not in self.method_entries:
+            return
+
+        methods_to_remove = self.collect_dependent_methods(method)
+        if not methods_to_remove:
+            return
+
+        message = f"确定从列表中移除 {method} 吗？"
+        dependent_methods = [name for name in methods_to_remove if name != method]
+        if dependent_methods:
+            message += "\n\n以下差分方法也会一起移除:\n" + "\n".join(dependent_methods)
+
+        if not messagebox.askyesno("确认移除", message):
+            return
+
+        for method_name in methods_to_remove:
+            self.method_entries.pop(method_name, None)
+            self.method_ui_defaults.pop(method_name, None)
+            self.method_filter_vars.pop(method_name, None)
+            self.method_offset_vars.pop(method_name, None)
+            if method_name in self.all_methods:
+                self.all_methods.remove(method_name)
+            if method_name in self.methods:
+                self.methods.remove(method_name)
+
+        self.rebuild_method_source_maps()
+        self.rebuild_method_filter_ui()
+        self.refresh_visible_methods(reload_frame=bool(self.frame_numbers))
+        self.mark_workspace_dirty()
+        self.status_label.config(text=f"已移除方法: {', '.join(methods_to_remove)}")
+
+    def open_errormap_dialog(self):
+        candidate_methods = [method for method in self.all_methods if self.is_source_method(method)]
+        if len(candidate_methods) < 2:
+            messagebox.showwarning("警告", "至少需要两个可读取源图的方法才能生成差分方法")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("生成差分方法")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        tk.Label(dialog, text="方法 A").grid(row=0, column=0, sticky=tk.W, padx=10, pady=(12, 6))
+        tk.Label(dialog, text="方法 B").grid(row=1, column=0, sticky=tk.W, padx=10, pady=6)
+
+        method_a_var = tk.StringVar(value=candidate_methods[0])
+        method_b_var = tk.StringVar(value=candidate_methods[1])
+        ttk.Combobox(dialog, textvariable=method_a_var, values=candidate_methods, width=42, state="readonly").grid(
+            row=0, column=1, padx=10, pady=(12, 6)
+        )
+        ttk.Combobox(dialog, textvariable=method_b_var, values=candidate_methods, width=42, state="readonly").grid(
+            row=1, column=1, padx=10, pady=6
+        )
+
+        def submit_errormap():
+            method_a = method_a_var.get().strip()
+            method_b = method_b_var.get().strip()
+            if not method_a or not method_b:
+                messagebox.showwarning("警告", "请选择两个方法", parent=dialog)
+                return
+            if method_a == method_b:
+                messagebox.showwarning("警告", "请选择两个不同的方法", parent=dialog)
+                return
+
+            self.add_errormap_method(method_a, method_b)
+            dialog.destroy()
+
+        button_frame = tk.Frame(dialog)
+        button_frame.grid(row=2, column=0, columnspan=2, pady=(8, 12))
+        tk.Button(button_frame, text="取消", command=dialog.destroy, width=10).pack(side=tk.LEFT, padx=6)
+        tk.Button(button_frame, text="添加差分方法", command=submit_errormap, bg="#5C6BC0", fg="white", width=14).pack(
+            side=tk.LEFT, padx=6
+        )
+
+    def add_errormap_method(self, method_a, method_b):
+        method_name = self.make_unique_session_method_name(f"{method_a}_vs_{method_b}_errormap")
+        self.add_method_entry(method_name, self.build_errormap_method_entry(method_a, method_b), selected=True, offset="0")
+        self.rebuild_method_filter_ui()
+        self.refresh_visible_methods(reload_frame=bool(self.frame_numbers))
+        self.mark_workspace_dirty()
+        self.status_label.config(text=f"已添加差分方法: {method_name}")
+
+    def get_source_frame_image_entry(self, source, frame_num):
+        return self.backend.get_frame_image_entry({"__source__": source}, "__source__", frame_num)
+
+    def load_source_frame_image(self, source, frame_num):
+        return self.backend.load_method_frame_image({"__source__": source}, "__source__", frame_num)
+
+    def get_method_render_frame_num(self, method, logical_frame_num):
+        return self.get_method_frame_num(method, logical_frame_num)
+
+    def get_method_title(self, method, logical_frame_num):
+        entry = self.get_method_entry(method) or {}
+        method_title = self.get_method_list_label(method)
+        render_frame_num = self.get_method_render_frame_num(method, logical_frame_num)
+        method_offset = self.get_method_frame_offset(method)
+        details = []
+
+        if method_offset != 0:
+            if render_frame_num is None:
+                details.append(f"偏移 {method_offset:+d}")
+            else:
+                details.append(f"偏移 {method_offset:+d} -> {render_frame_num}")
+
+        if entry.get("type") == "errormap":
+            parent_frames = []
+            parent_render_frame = render_frame_num if render_frame_num is not None else logical_frame_num
+            for parent in entry.get("parents", ()):
+                actual_parent_frame = self.get_method_frame_num(parent, parent_render_frame)
+                parent_frames.append(f"{parent}:{actual_parent_frame if actual_parent_frame is not None else '-'}")
+            if parent_frames:
+                details.append("差分 " + " vs ".join(parent_frames))
+
+        if not details:
+            return self.shorten_text(method_title, 32)
+        return self.shorten_text(f"{method_title} ({'; '.join(details)})", 32)
+
     def rebuild_method_filter_ui(self):
         if self.method_filter_content is None:
             return
@@ -407,53 +1079,150 @@ class MultiMethodCropperGUI:
         for widget in self.method_filter_content.winfo_children():
             widget.destroy()
 
+        self.is_updating_method_filter_controls = True
+        previous_selected = {method: var.get() for method, var in self.method_filter_vars.items()}
+        previous_offsets = {method: var.get() for method, var in self.method_offset_vars.items()}
         self.method_filter_vars = {}
+        self.method_offset_vars = {}
 
         if not self.all_methods:
+            self.is_updating_method_filter_controls = False
             tk.Label(self.method_filter_content, text="扫描后将在这里列出方法", fg="gray").pack(anchor=tk.W, pady=4)
+            self.set_method_filter_pending(False)
             self.update_method_filter_summary()
             return
 
         for method in self.all_methods:
-            var = tk.BooleanVar(value=True)
+            default_state = self.method_ui_defaults.pop(method, None)
+            selected_value = previous_selected.get(method, default_state["selected"] if default_state else True)
+            offset_value = previous_offsets.get(method, default_state["offset"] if default_state else "0")
+
+            var = tk.BooleanVar(value=selected_value)
+            var.trace_add("write", self.on_method_filter_control_changed)
+            offset_var = tk.StringVar(value=offset_value)
+            offset_var.trace_add("write", self.on_method_filter_control_changed)
             self.method_filter_vars[method] = var
+            self.method_offset_vars[method] = offset_var
+
+            row_frame = tk.Frame(self.method_filter_content, pady=2)
+            row_frame.pack(fill=tk.X, anchor=tk.W)
+
+            title_frame = tk.Frame(row_frame)
+            title_frame.pack(fill=tk.X, anchor=tk.W)
+
             check = tk.Checkbutton(
-                self.method_filter_content,
-                text=method,
+                title_frame,
+                text=self.get_method_list_label(method),
                 variable=var,
                 anchor="w",
-                command=self.on_method_filter_changed,
             )
-            check.pack(fill=tk.X, anchor=tk.W)
+            check.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
             check.bind("<MouseWheel>", self.on_method_filter_mousewheel)
 
+            control_frame = tk.Frame(row_frame)
+            control_frame.pack(fill=tk.X, anchor=tk.W, padx=(28, 0), pady=(2, 0))
+
+            tk.Label(control_frame, text="偏移", fg="gray").pack(side=tk.LEFT)
+            offset_entry = tk.Entry(control_frame, width=5, textvariable=offset_var, justify=tk.RIGHT)
+            offset_entry.pack(side=tk.LEFT, padx=(6, 0))
+            offset_entry.bind("<MouseWheel>", self.on_method_filter_mousewheel)
+
+            action_frame = tk.Frame(control_frame)
+            action_frame.pack(side=tk.RIGHT)
+            tk.Button(action_frame, text="移除", width=4, command=lambda m=method: self.remove_method(m)).pack(side=tk.RIGHT)
+            tk.Button(action_frame, text="克隆", width=4, command=lambda m=method: self.clone_method(m)).pack(side=tk.RIGHT, padx=(0, 4))
+
+        self.is_updating_method_filter_controls = False
+        self.set_method_filter_pending(False)
         self.update_method_filter_summary()
 
     def update_method_filter_summary(self):
+        selected_count = sum(1 for var in self.method_filter_vars.values() if var.get())
+        prefix = "待应用" if self.method_filter_pending_changes else "显示"
         if self.methods_summary_label is not None:
-            self.methods_summary_label.config(text=f"显示 {len(self.methods)} / {len(self.all_methods)}")
+            self.methods_summary_label.config(text=f"{prefix} {selected_count} / {len(self.all_methods)}")
+
+    def set_method_filter_pending(self, pending):
+        self.method_filter_pending_changes = pending
+        if self.method_filter_apply_button is not None:
+            self.method_filter_apply_button.config(state=tk.NORMAL if pending else tk.DISABLED)
+        self.update_method_filter_summary()
+
+    def on_method_filter_control_changed(self, *_args):
+        if self.is_updating_method_filter_controls:
+            return
+        self.set_method_filter_pending(True)
+
+    def validate_method_offsets(self):
+        normalized_offsets = {}
+        for method, offset_var in self.method_offset_vars.items():
+            raw_value = offset_var.get().strip()
+            if not raw_value:
+                normalized_offsets[method] = 0
+                continue
+            try:
+                normalized_offsets[method] = int(raw_value)
+            except ValueError:
+                messagebox.showwarning("警告", f"方法 {method} 的偏移必须是整数")
+                return None
+
+        self.is_updating_method_filter_controls = True
+        try:
+            for method, offset in normalized_offsets.items():
+                self.method_offset_vars[method].set(str(offset))
+        finally:
+            self.is_updating_method_filter_controls = False
+
+        return normalized_offsets
+
+    def get_method_frame_offset(self, method):
+        offset_var = self.method_offset_vars.get(method)
+        if offset_var is None:
+            return 0
+        try:
+            return int(offset_var.get().strip() or "0")
+        except ValueError:
+            return 0
+
+    def get_method_frame_num(self, method, logical_frame_num):
+        offset = self.get_method_frame_offset(method)
+        if offset == 0:
+            return logical_frame_num
+
+        target_frame_num = int(logical_frame_num) + offset
+        if target_frame_num < 0:
+            return None
+        return str(target_frame_num).zfill(len(logical_frame_num))
 
     def update_method_status(self):
         self.update_method_filter_summary()
         self.status_label.config(
-            text=f"已扫描 {len(self.all_methods)} 个方法，当前显示 {len(self.methods)} 个，{len(self.frame_numbers)} 帧"
+            text=f"方法列表 {len(self.all_methods)} 个，当前显示 {len(self.methods)} 个，{len(self.frame_numbers)} 帧"
         )
 
     def refresh_visible_methods(self, reload_frame=True):
+        if self.method_filter_vars:
+            normalized_offsets = self.validate_method_offsets()
+            if normalized_offsets is None:
+                return
         self.methods = [method for method in self.all_methods if self.method_filter_vars.get(method, tk.BooleanVar()).get()]
+        self.set_method_filter_pending(False)
         self.update_method_status()
         if reload_frame and self.frame_numbers:
             self.load_current_frame()
         elif not self.methods:
             self.preview_canvas.delete("all")
+        self.mark_workspace_dirty()
 
     def on_method_filter_changed(self):
-        self.refresh_visible_methods(reload_frame=True)
+        self.set_method_filter_pending(True)
 
     def set_all_method_filters(self, selected):
+        self.is_updating_method_filter_controls = True
         for var in self.method_filter_vars.values():
             var.set(selected)
-        self.refresh_visible_methods(reload_frame=True)
+        self.is_updating_method_filter_controls = False
+        self.set_method_filter_pending(True)
         
     def setup_ui(self):
         # 顶部控制面板
@@ -482,7 +1251,7 @@ class MultiMethodCropperGUI:
         # 缩放控制
         zoom_frame = tk.Frame(control_frame)
         zoom_frame.pack(side=tk.LEFT, padx=20)
-        tk.Label(zoom_frame, text="缩放(滚轮):").pack(side=tk.LEFT)
+        tk.Label(zoom_frame, text="缩放(Ctrl+滚轮):").pack(side=tk.LEFT)
         tk.Button(zoom_frame, text="重置1:1", command=self.reset_zoom, bg="#FF9800", fg="white").pack(side=tk.LEFT, padx=5)
 
         size_frame = tk.Frame(control_frame)
@@ -503,6 +1272,18 @@ class MultiMethodCropperGUI:
         self.method_view_size_value_label = tk.Label(size_frame, width=7, anchor=tk.W)
         self.method_view_size_value_label.pack(side=tk.LEFT)
         self.update_method_view_size_label(self.method_view_size)
+
+        workspace_frame = tk.Frame(self.root, padx=10)
+        workspace_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 4))
+        tk.Button(workspace_frame, text="保存工程", command=self.save_workspace,
+              bg="#00897B", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(workspace_frame, text="工程另存", command=self.save_workspace_as,
+              bg="#26A69A", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(workspace_frame, text="导入工程", command=self.load_workspace,
+              bg="#546E7A", fg="white", padx=10).pack(side=tk.LEFT, padx=5)
+        self.workspace_label = tk.Label(workspace_frame, text="工程: 未保存", fg="gray")
+        self.workspace_label.pack(side=tk.LEFT, padx=10)
+        self.update_workspace_label()
         
         # 主容器
         main_container = tk.Frame(self.root)
@@ -548,6 +1329,18 @@ class MultiMethodCropperGUI:
         self.frame_jump_entry = tk.Entry(nav_frame, width=10)
         self.frame_jump_entry.pack(side=tk.LEFT, padx=5)
         tk.Button(nav_frame, text="跳转", command=self.jump_to_frame).pack(side=tk.LEFT, padx=5)
+
+        bookmark_frame = tk.Frame(left_frame)
+        bookmark_frame.pack(fill=tk.X, pady=(0, 5))
+        self.bookmark_toggle_button = tk.Button(bookmark_frame, text="收藏当前帧", command=self.toggle_current_bookmark)
+        self.bookmark_toggle_button.pack(side=tk.LEFT, padx=5)
+        tk.Button(bookmark_frame, text="上一书签", command=lambda: self.jump_relative_bookmark(-1)).pack(side=tk.LEFT, padx=5)
+        tk.Button(bookmark_frame, text="下一书签", command=lambda: self.jump_relative_bookmark(1)).pack(side=tk.LEFT, padx=5)
+        tk.Label(bookmark_frame, text="书签:").pack(side=tk.LEFT, padx=(12, 4))
+        self.bookmark_combo = ttk.Combobox(bookmark_frame, state="readonly", width=12)
+        self.bookmark_combo.pack(side=tk.LEFT)
+        tk.Button(bookmark_frame, text="跳转书签", command=self.jump_to_bookmark).pack(side=tk.LEFT, padx=5)
+        self.update_bookmark_controls()
         
         # 右侧：信息和控制面板
         right_frame = tk.Frame(main_container, width=320)
@@ -559,11 +1352,14 @@ class MultiMethodCropperGUI:
         methods_frame.pack(fill=tk.X, pady=5)
 
         methods_toolbar = tk.Frame(methods_frame)
-        methods_toolbar.pack(fill=tk.X, pady=(0, 4))
+        methods_toolbar.pack(fill=tk.X, pady=(0, 2))
         tk.Button(methods_toolbar, text="全选", command=lambda: self.set_all_method_filters(True), width=6).pack(side=tk.LEFT)
         tk.Button(methods_toolbar, text="全不选", command=lambda: self.set_all_method_filters(False), width=6).pack(side=tk.LEFT, padx=(6, 0))
-        self.methods_summary_label = tk.Label(methods_toolbar, text="显示 0 / 0", fg="gray")
-        self.methods_summary_label.pack(side=tk.RIGHT)
+        self.method_filter_apply_button = tk.Button(methods_toolbar, text="确定", command=self.refresh_visible_methods, width=6, state=tk.DISABLED)
+        self.method_filter_apply_button.pack(side=tk.LEFT, padx=(6, 0))
+        tk.Button(methods_toolbar, text="生成差分", command=self.open_errormap_dialog, width=8).pack(side=tk.LEFT, padx=(6, 0))
+        self.methods_summary_label = tk.Label(methods_frame, text="显示 0 / 0", fg="gray", anchor=tk.W)
+        self.methods_summary_label.pack(fill=tk.X, pady=(0, 4))
 
         methods_list_container = tk.Frame(methods_frame, height=220)
         methods_list_container.pack(fill=tk.BOTH, expand=True)
@@ -790,41 +1586,80 @@ class MultiMethodCropperGUI:
         if not self.output_target:
             raise RuntimeError("未配置输出目标")
         self.backend.crop.save_output_image(img, target_path, self.output_target)
-    
-    def on_close(self):
-        """Clean up connections before closing the app."""
-        self.backend.close()
-        self.root.destroy()
-    
-    def clear_input_folders(self):
-        """Clear selected input folders and reset related UI state."""
+
+    def clear_workspace_state(self, clear_output=True, preserve_workspace_path=False):
         self.input_folder = ""
         self.input_folders = []
         self.input_sources = []
         self.methods = []
         self.all_methods = []
+        self.scanned_methods = []
+        self.method_entries = {}
         self.method_paths = {}
         self.method_sources = {}
         self.methods_with_frames = []
+        self.method_ui_defaults = {}
+        self.method_filter_vars = {}
+        self.method_offset_vars = {}
         self.frame_numbers = []
         self.current_frame_index = 0
+        self.bookmarked_frames.clear()
         self.close_all_remote_connections()
+
+        if clear_output:
+            self.output_target = None
+            self.output_folder = str(self.config.default_output_dir)
+
         for img in self.method_images.values():
             try:
                 img.close()
-            except:
+            except Exception:
                 pass
+
         self.method_images.clear()
         self.display_images.clear()
         self.photo_images.clear()
         self.canvases.clear()
         self.rect_ids.clear()
+        self.current_rect_ids.clear()
+        self.crop_boxes.clear()
+        self.crop_start_x = None
+        self.crop_start_y = None
+        self.crop_end_x = None
+        self.crop_end_y = None
+        self.zoom_level = 1.0
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.preview_canvas.delete("all")
         self.rebuild_method_filter_ui()
+        self.rebuild_crop_boxes_list()
+        self.update_bookmark_controls()
+        self.update_output_label()
         self.input_label.config(text="未选择文件夹", fg="gray")
         self.frame_info_label.config(text="帧: 0 / 0")
+        self.coord_label.config(text="(-, -)")
+        self.size_label.config(text="- × -")
+        self.end_coord_label.config(text="(-, -)")
+
+        if not preserve_workspace_path:
+            self.set_workspace_file_path(None)
+    
+    def on_close(self):
+        """Clean up connections before closing the app."""
+        if not self.prompt_save_workspace_if_dirty("退出软件"):
+            return
+        self.backend.close()
+        self.root.destroy()
+    
+    def clear_input_folders(self):
+        """Clear selected input folders and reset related UI state."""
+        if not self.is_restoring_workspace and not self.prompt_save_workspace_if_dirty("清空输入"):
+            return
+        self.clear_workspace_state(clear_output=False, preserve_workspace_path=True)
+        self.mark_workspace_dirty()
         self.status_label.config(text="已清空输入文件夹")
             
     def select_output_folder(self):
@@ -835,7 +1670,8 @@ class MultiMethodCropperGUI:
                 "type": "local",
                 "path": folder
             }
-            self.output_label.config(text=os.path.basename(folder), fg="black")
+            self.update_output_label()
+            self.mark_workspace_dirty()
     
     def open_remote_output_dialog_with_presets(self):
         if not self.backend.is_remote_available:
@@ -853,10 +1689,8 @@ class MultiMethodCropperGUI:
                 return
 
             self.output_folder = self.output_target["path"]
-            self.output_label.config(
-                text=f"{self.output_target['server_label']}:{self.output_target['path']}",
-                fg="black",
-            )
+            self.update_output_label()
+            self.mark_workspace_dirty()
             dialog.destroy()
 
         self.create_remote_dialog(
@@ -979,10 +1813,44 @@ class MultiMethodCropperGUI:
         return self.backend.scan.list_method_frame_files(source)
     
     def get_frame_image_entry(self, method, frame_num):
-        return self.backend.get_frame_image_entry(self.method_sources, method, frame_num)
+        entry = self.get_method_entry(method)
+        if not entry or entry.get("type") != "source":
+            return None
+        return self.get_source_frame_image_entry(entry.get("source", {}), frame_num)
     
     def load_method_frame_image(self, method, frame_num):
-        return self.backend.load_method_frame_image(self.method_sources, method, frame_num)
+        entry = self.get_method_entry(method)
+        if not entry:
+            raise ValueError(f"unknown method: {method}")
+
+        render_frame_num = self.get_method_render_frame_num(method, frame_num)
+        if render_frame_num is None:
+            raise ValueError(f"方法 {method} 的偏移导致帧号超出范围")
+
+        if entry.get("type") == "source":
+            image_entry = self.get_source_frame_image_entry(entry.get("source", {}), render_frame_num)
+            if image_entry is None:
+                raise ValueError(f"方法 {method} 缺少帧 {render_frame_num}")
+            image = self.load_source_frame_image(entry.get("source", {}), render_frame_num)
+            if image is None:
+                raise ValueError(f"方法 {method} 无法读取帧 {render_frame_num}")
+            return image
+
+        parent_a, parent_b = entry.get("parents", (None, None))
+        if not parent_a or not parent_b:
+            raise ValueError(f"差分方法 {method} 缺少来源方法")
+
+        first_image = None
+        second_image = None
+        try:
+            first_image = self.load_method_frame_image(parent_a, render_frame_num)
+            second_image = self.load_method_frame_image(parent_b, render_frame_num)
+            return self.backend.crop.create_absolute_error_map_image(first_image, second_image)
+        finally:
+            if first_image is not None:
+                first_image.close()
+            if second_image is not None:
+                second_image.close()
              
     def scan_methods_and_frames(self):
         """扫描子文件夹和帧序列"""
@@ -1000,10 +1868,15 @@ class MultiMethodCropperGUI:
             messagebox.showwarning("警告", message)
             return
         
+        self.scanned_methods = list(result.methods)
+        self.method_entries = {
+            method: self.build_source_method_entry(result.method_sources[method], result.method_paths[method], origin="scan")
+            for method in result.methods
+        }
         self.all_methods = result.methods
         self.methods = list(result.methods)
-        self.method_paths = result.method_paths
-        self.method_sources = result.method_sources
+        self.rebuild_method_source_maps()
+        self.method_ui_defaults = {}
         self.methods_with_frames = result.methods_with_frames
         self.frame_numbers = result.frame_numbers
 
@@ -1026,13 +1899,14 @@ class MultiMethodCropperGUI:
             fg="black"
         )
         self.status_label.config(
-            text=f"已扫描 {len(self.all_methods)} 个方法，当前显示 {len(self.methods)} 个，{len(self.frame_numbers)} 帧 "
+            text=f"方法列表 {len(self.all_methods)} 个，当前显示 {len(self.methods)} 个，{len(self.frame_numbers)} 帧 "
                  f"(有帧的方法: {', '.join(methods_with_frames)})"
         )
         
         # 加载第一帧
         self.current_frame_index = 0
         self.load_current_frame()
+        self.mark_workspace_dirty()
         
     def load_current_frame(self):
         """加载当前帧的所有方法的图片"""
@@ -1062,9 +1936,11 @@ class MultiMethodCropperGUI:
         import gc
         gc.collect()
 
+        bookmark_mark = " ★" if frame_num in self.bookmarked_frames else ""
         self.frame_info_label.config(
-            text=f"帧: {self.current_frame_index + 1} / {len(self.frame_numbers)} (帧号: {frame_num})"
+            text=f"帧: {self.current_frame_index + 1} / {len(self.frame_numbers)} (帧号: {frame_num}){bookmark_mark}"
         )
+        self.update_bookmark_controls()
 
         if not self.methods:
             self.preview_canvas.delete("all")
@@ -1097,21 +1973,15 @@ class MultiMethodCropperGUI:
             )
             method_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
             method_frame.grid_propagate(False)
+
+            method_title = self.get_method_title(method, frame_num)
             
             # 方法标签
-            tk.Label(method_frame, text=method, font=("Arial", 11, "bold"), 
+            tk.Label(method_frame, text=method_title, font=("Arial", 11, "bold"), 
                     bg="#E3F2FD", pady=5).pack(fill=tk.X)
             
-            # 查找图片路径（优先exr，如果不存在则尝试png）
-            img_path = self.get_frame_image_entry(method, frame_num)
-            
-            if img_path is None:
-                tk.Label(method_frame, text=f"文件不存在: 帧号 {frame_num}", 
-                        fg="red").pack()
-                continue
-            
             try:
-                # 加载图片（自动识别格式）
+                # 加载图片（自动识别格式或实时生成差分图）
                 img = self.load_method_frame_image(method, frame_num)
                 
                 self.method_images[method] = img
@@ -1226,6 +2096,7 @@ class MultiMethodCropperGUI:
         self.method_view_size = size_value
         if self.frame_numbers:
             self.load_current_frame()
+        self.mark_workspace_dirty()
         self.status_label.config(
             text=f"预览大小已调整为 {self.method_view_size}px"
         )
@@ -1441,7 +2312,9 @@ class MultiMethodCropperGUI:
         
         try:
             # 使用第一个方法的图片作为预览
-            first_method = self.methods[0]
+            first_method = next((method for method in self.methods if method in self.method_images), None)
+            if first_method is None:
+                return
             if first_method not in self.method_images:
                 return
             
@@ -1492,7 +2365,10 @@ class MultiMethodCropperGUI:
                 return
             
             # 检查是否超出范围（使用第一张图片）
-            first_method = self.methods[0]
+            first_method = next((method for method in self.methods if method in self.method_images), None)
+            if first_method is None:
+                messagebox.showwarning("警告", "当前没有可用图片")
+                return
             img = self.method_images[first_method]
             
             if x + w > img.width or y + h > img.height:
@@ -1545,6 +2421,7 @@ class MultiMethodCropperGUI:
         self.size_label.config(text="- × -")
         self.end_coord_label.config(text="(-, -)")
         self.preview_canvas.delete("all")
+        self.mark_workspace_dirty()
         
         self.status_label.config(text=f"已添加裁剪框 {box_idx}")
     
@@ -1573,7 +2450,7 @@ class MultiMethodCropperGUI:
         self.boxes_listbox.delete(0, tk.END)
         for i, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
             self.boxes_listbox.insert(tk.END, f"框{i}: ({x1}, {y1}) -> ({x2}, {y2}) [{x2-x1}×{y2-y1}]")
-        
+        self.mark_workspace_dirty()
         self.status_label.config(text=f"已删除裁剪框")
     
     def clear_all_boxes(self):
@@ -1604,6 +2481,7 @@ class MultiMethodCropperGUI:
         self.size_label.config(text="- × -")
         self.end_coord_label.config(text="(-, -)")
         self.preview_canvas.delete("all")
+        self.mark_workspace_dirty()
         
         self.status_label.config(text="已清空所有裁剪框")
         
@@ -1611,23 +2489,17 @@ class MultiMethodCropperGUI:
         """上一帧"""
         if not self.frame_numbers:
             return
-        
-        # 清空当前裁剪框选择
-        self.clear_all_boxes()
-        
-        self.current_frame_index = (self.current_frame_index - 1) % len(self.frame_numbers)
-        self.load_current_frame()
+
+        target_index = (self.current_frame_index - 1) % len(self.frame_numbers)
+        self.set_current_frame_by_num(self.frame_numbers[target_index])
         
     def next_frame(self):
         """下一帧"""
         if not self.frame_numbers:
             return
-        
-        # 清空当前裁剪框选择
-        self.clear_all_boxes()
-        
-        self.current_frame_index = (self.current_frame_index + 1) % len(self.frame_numbers)
-        self.load_current_frame()
+
+        target_index = (self.current_frame_index + 1) % len(self.frame_numbers)
+        self.set_current_frame_by_num(self.frame_numbers[target_index])
         
     def jump_to_frame(self):
         """跳转到指定帧号"""
@@ -1635,11 +2507,7 @@ class MultiMethodCropperGUI:
             frame_num = self.frame_jump_entry.get().zfill(4)  # 补齐到4位
             
             if frame_num in self.frame_numbers:
-                # 清空当前裁剪框选择
-                self.clear_all_boxes()
-                
-                self.current_frame_index = self.frame_numbers.index(frame_num)
-                self.load_current_frame()
+                self.set_current_frame_by_num(frame_num)
             else:
                 messagebox.showwarning("警告", f"帧号 {frame_num} 不存在")
         except Exception as e:
@@ -1656,39 +2524,14 @@ class MultiMethodCropperGUI:
             return
         
         frame_num = self.frame_numbers[self.current_frame_index]
-        success_count = 0
-        collage_data = []
-        
-        for method in self.methods:
-            if method not in self.method_images:
-                continue
-            
-            try:
-                img = self.method_images[method]
-                output_method_folder = self.join_output_path(self.output_target["path"], method)
-                cropped_images = []
-                
-                # 裁剪并保存每个裁剪框
-                for box_idx, (x1, y1, x2, y2) in enumerate(self.crop_boxes, 1):
-                    cropped = img.crop((x1, y1, x2, y2))
-                    cropped_images.append(cropped.copy())
-                    
-                    # 保存为PNG格式
-                    output_path = self.join_output_path(output_method_folder, f"frame{frame_num}_box{box_idx}.png")
-                    self.save_output_image(cropped, output_path)
-                
-                # 生成可视化标记图
-                self.save_visualization_map(img, output_method_folder, frame_num)
-                collage_data.append({
-                    "method": method,
-                    "full": self.create_visualization_map_image(img),
-                    "crops": cropped_images
-                })
-                
-                success_count += 1
-                
-            except Exception as e:
-                print(f"处理 {method} 帧 {frame_num} 失败: {e}")
+        success_count, collage_data = self.backend.crop.crop_loaded_images(
+            frame_num,
+            self.methods,
+            self.method_images,
+            self.crop_boxes,
+            self.output_target,
+            self.box_colors,
+        )
         
         messagebox.showinfo("完成", f"当前帧批量裁剪完成！\n成功: {success_count} 个方法\n每个方法裁剪了 {len(self.crop_boxes)} 个区域\n输出位置: {self.get_output_display_name()}")
         self.status_label.config(text=f"完成！成功处理 {success_count} 个方法")
@@ -1774,15 +2617,10 @@ class MultiMethodCropperGUI:
                 img = None  # 初始化为None
                 try:
                     # 更新进度（开始处理）
-                    self.status_label.config(text=f"处理中... {total}/{total_images} ({method} - 帧{frame_num})")
+                    progress_text = f"处理中... {total}/{total_images} ({method} - 帧{frame_num})"
+                    self.status_label.config(text=progress_text)
                     self.root.update()
-                    
-                    # 查找图片路径（优先exr，如果不存在则尝试png）
-                    img_path = self.get_frame_image_entry(method, frame_num)
-                    if img_path is None:
-                        fail_count += 1
-                        continue
-                    
+
                     img = self.load_method_frame_image(method, frame_num)
                     
                     # 裁剪并保存每个裁剪框
