@@ -399,6 +399,35 @@ class CropService:
     def __init__(self, storage: RemoteStorageService) -> None:
         self.storage = storage
 
+    def get_frame_output_folder(self, output_target: OutputTarget, frame_num: str) -> str:
+        return self.storage.join_path(output_target, str(output_target["path"]), f"frame{frame_num}")
+
+    def get_frame_method_output_folder(self, output_target: OutputTarget, frame_num: str, method: str) -> str:
+        return self.storage.join_path(output_target, self.get_frame_output_folder(output_target, frame_num), method)
+
+    def _fit_collage_label(self, draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> str:
+        text = str(text)
+        if max_width <= 0:
+            return ""
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return text
+
+        ellipsis = "..."
+        low = 0
+        high = len(text)
+        best = ellipsis if draw.textbbox((0, 0), ellipsis, font=font)[2] <= max_width else ""
+
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = text[:mid].rstrip("_ -") + ellipsis
+            if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        return best
+
     def has_output_target(self, output_target: OutputTarget | None) -> bool:
         return output_target is not None and bool(output_target.get("path"))
 
@@ -479,16 +508,17 @@ class CropService:
         font = ImageFont.load_default()
         padding = 24
         header_gap = 12
-        header_height = 18
-        image_gap = 0
+        image_gap = 24
         title_gap = 10
         label_gap = 4
-        label_height = 14
         separator_gap = 20
-        separator_height = 4
-        section_title_height = 16
         max_canvas_width = 2200
         max_canvas_height = 1800
+        text_sample_box = ImageDraw.Draw(Image.new("RGB", (8, 8), "white")).textbbox((0, 0), "Ag", font=font)
+        text_line_height = max(12, text_sample_box[3] - text_sample_box[1])
+        header_height = text_line_height
+        label_height = text_line_height
+        section_title_height = text_line_height
 
         method_count = max(1, len(collage_data))
         section_count = len(crop_boxes) + 1
@@ -499,16 +529,17 @@ class CropService:
             padding * 2
             + (section_title_height + title_gap + base_full_thumb_size[1] + label_gap + label_height)
             + len(crop_boxes) * (section_title_height + title_gap + base_crop_thumb_size[1] + label_gap + label_height)
-            + (section_count - 1) * (separator_gap + separator_height)
+            + (section_count - 1) * separator_gap
         )
         scale = min(1.0, max_canvas_width / base_width, max_canvas_height / base_height)
         scale = max(scale, 0.35)
 
         padding = max(16, int(padding * max(scale, 0.6)))
+        header_gap = max(10, int(header_gap * max(scale, 0.6)))
+        image_gap = max(14, int(image_gap * max(scale, 0.6)))
         title_gap = max(8, int(title_gap * max(scale, 0.6)))
         label_gap = max(3, int(label_gap * max(scale, 0.6)))
         separator_gap = max(12, int(separator_gap * max(scale, 0.6)))
-        separator_height = max(2, int(separator_height * max(scale, 0.6)))
         full_thumb_size = (max(140, int(base_full_thumb_size[0] * scale)), max(96, int(base_full_thumb_size[1] * scale)))
         crop_thumb_size = (max(96, int(base_crop_thumb_size[0] * scale)), max(96, int(base_crop_thumb_size[1] * scale)))
 
@@ -547,7 +578,6 @@ class CropService:
         canvas_height = padding * 2 + header_height + header_gap
         canvas_height += sum(section["height"] for section in prepared_sections)
         canvas_height += separator_gap * (len(prepared_sections) - 1)
-        canvas_height += separator_height * (len(prepared_sections) - 1)
 
         collage = Image.new("RGB", (canvas_width, canvas_height), "white")
         draw = ImageDraw.Draw(collage)
@@ -562,22 +592,22 @@ class CropService:
             current_x = padding
             for method, thumb in section["thumbs"]:
                 collage.paste(thumb, (current_x, current_y))
-                label_box = draw.textbbox((0, 0), str(method), font=font)
+                label_text = self._fit_collage_label(draw, str(method), font, thumb.width)
+                label_box = draw.textbbox((0, 0), label_text, font=font)
                 label_width = label_box[2] - label_box[0]
                 label_x = current_x + max(0, (thumb.width - label_width) // 2)
                 label_y = current_y + int(section["max_thumb_height"]) + label_gap
-                draw.text((label_x, label_y), str(method), fill="black", font=font)
+                draw.text((label_x, label_y), label_text, fill="black", font=font)
                 thumb.close()
                 current_x += thumb.width + image_gap
 
             current_y += int(section["strip_height"])
 
             if section_idx < len(prepared_sections) - 1:
-                current_y += separator_gap // 2
-                draw.rectangle([padding, current_y, canvas_width - padding, current_y + separator_height], fill="#C8C8C8")
-                current_y += separator_height + separator_gap // 2
+                current_y += separator_gap
 
-        collage_path = self.storage.join_path(output_target, str(output_target["path"]), f"frame{frame_num}_summary.png")
+        frame_output_folder = self.get_frame_output_folder(output_target, frame_num)
+        collage_path = self.storage.join_path(output_target, frame_output_folder, f"frame{frame_num}_summary.png")
         self.save_output_image(collage, collage_path, output_target)
         collage.close()
 
@@ -598,7 +628,7 @@ class CropService:
             if img is None:
                 continue
 
-            output_method_folder = self.storage.join_path(output_target, str(output_target["path"]), method)
+            output_method_folder = self.get_frame_method_output_folder(output_target, frame_num, method)
             cropped_images: list[Image.Image] = []
 
             for box_idx, (x1, y1, x2, y2) in enumerate(crop_boxes, 1):
@@ -637,8 +667,6 @@ class CropService:
         total_images = len(methods) * len(frame_numbers)
 
         for method in methods:
-            output_method_folder = self.storage.join_path(output_target, str(output_target["path"]), method)
-
             for frame_num in frame_numbers:
                 total += 1
                 img = None
@@ -655,6 +683,8 @@ class CropService:
                     if img is None:
                         fail_count += 1
                         continue
+
+                    output_method_folder = self.get_frame_method_output_folder(output_target, frame_num, method)
 
                     for box_idx, (x1, y1, x2, y2) in enumerate(crop_boxes, 1):
                         if x2 > img.width or y2 > img.height:
