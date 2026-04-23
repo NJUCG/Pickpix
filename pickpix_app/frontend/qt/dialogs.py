@@ -16,9 +16,11 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -80,6 +82,7 @@ class RemoteSourceDialog(QDialog):
         path_label: str,
         confirm_text: str,
         presets: Sequence[dict],
+        manage_servers: Callable[[], Sequence[dict]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -87,15 +90,21 @@ class RemoteSourceDialog(QDialog):
         self.setModal(True)
         self.resize(420, 320)
         self._presets = list(presets)
+        self._manage_servers = manage_servers
         self._result: dict | None = None
 
         main_layout = QVBoxLayout(self)
         form = QFormLayout()
 
+        server_row = QHBoxLayout()
         self.preset_combo = QComboBox(self)
-        self.preset_combo.addItems([preset["label"] for preset in self._presets])
         self.preset_combo.currentIndexChanged.connect(self._apply_preset)
-        form.addRow("服务器:", self.preset_combo)
+        server_row.addWidget(self.preset_combo, stretch=1)
+        if self._manage_servers is not None:
+            manage_button = QPushButton("管理服务器", self)
+            manage_button.clicked.connect(self._open_server_manager)
+            server_row.addWidget(manage_button)
+        form.addRow("服务器:", server_row)
 
         self.host_edit = QLineEdit(self)
         self.host_edit.setReadOnly(True)
@@ -126,8 +135,43 @@ class RemoteSourceDialog(QDialog):
         button_box.rejected.connect(self.reject)
         main_layout.addWidget(button_box)
 
-        if self._presets:
-            self._apply_preset()
+        self._reload_presets()
+
+    def _reload_presets(self, preferred_key: str | None = None) -> None:
+        current_key = preferred_key or self._get_current_preset_key()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for preset in self._presets:
+            self.preset_combo.addItem(str(preset.get("label", "")), str(preset.get("key", "")))
+        self.preset_combo.blockSignals(False)
+
+        if not self._presets:
+            self.host_edit.clear()
+            self.port_edit.clear()
+            self.user_edit.clear()
+            self.password_edit.clear()
+            return
+
+        target_index = 0
+        if current_key:
+            for index, preset in enumerate(self._presets):
+                if str(preset.get("key", "")) == current_key:
+                    target_index = index
+                    break
+        self.preset_combo.setCurrentIndex(target_index)
+        self._apply_preset()
+
+    def _get_current_preset_key(self) -> str:
+        if self.preset_combo.count() <= 0:
+            return ""
+        return str(self.preset_combo.currentData() or "")
+
+    def _open_server_manager(self) -> None:
+        if self._manage_servers is None:
+            return
+        updated_presets = self._manage_servers()
+        self._presets = list(updated_presets)
+        self._reload_presets()
 
     def _apply_preset(self) -> None:
         if not self._presets:
@@ -141,7 +185,7 @@ class RemoteSourceDialog(QDialog):
 
     def _on_accept(self) -> None:
         if not self._presets:
-            QMessageBox.warning(self, "警告", "config 中没有可用的服务器预设")
+            QMessageBox.warning(self, "警告", "没有可用服务器，请先添加服务器配置")
             return
         preset = self._presets[max(0, self.preset_combo.currentIndex())]
         remote_path = self.path_edit.text().strip()
@@ -171,6 +215,245 @@ class RemoteSourceDialog(QDialog):
 
     def get_result(self) -> dict | None:
         return self._result
+
+
+class ServerManagerDialog(QDialog):
+    def __init__(
+        self,
+        presets: Sequence[dict],
+        save_server: Callable[[dict, str | None], dict],
+        delete_server: Callable[[str], bool],
+        test_server: Callable[[dict], tuple[bool, str]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("服务器管理")
+        self.setModal(True)
+        self.resize(720, 420)
+
+        self._save_server = save_server
+        self._delete_server = delete_server
+        self._test_server = test_server
+        self._servers = [dict(preset) for preset in presets]
+        self._new_server_counter = 1
+
+        layout = QHBoxLayout(self)
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel("服务器列表"))
+        self.server_list = QListWidget(self)
+        self.server_list.currentRowChanged.connect(self._on_server_selected)
+        left.addWidget(self.server_list, stretch=1)
+
+        left_buttons = QHBoxLayout()
+        add_button = QPushButton("新增", self)
+        add_button.clicked.connect(self._add_server)
+        left_buttons.addWidget(add_button)
+
+        self.delete_button = QPushButton("删除", self)
+        self.delete_button.clicked.connect(self._delete_selected_server)
+        left_buttons.addWidget(self.delete_button)
+        left.addLayout(left_buttons)
+
+        layout.addLayout(left, stretch=1)
+
+        right = QVBoxLayout()
+        form = QFormLayout()
+
+        self.label_edit = QLineEdit(self)
+        form.addRow("名称:", self.label_edit)
+
+        self.host_edit = QLineEdit(self)
+        form.addRow("地址:", self.host_edit)
+
+        self.port_spin = QSpinBox(self)
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(22)
+        form.addRow("端口:", self.port_spin)
+
+        self.user_edit = QLineEdit(self)
+        form.addRow("用户名:", self.user_edit)
+
+        self.password_edit = QLineEdit(self)
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("密码:", self.password_edit)
+
+        right.addLayout(form)
+
+        action_row = QHBoxLayout()
+        self.test_button = QPushButton("测试连接", self)
+        self.test_button.clicked.connect(self._test_selected_server)
+        action_row.addWidget(self.test_button)
+
+        self.save_button = QPushButton("保存服务器", self)
+        self.save_button.clicked.connect(self._save_selected_server)
+        action_row.addWidget(self.save_button)
+        action_row.addStretch(1)
+        right.addLayout(action_row)
+        right.addStretch(1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_button = QPushButton("关闭", self)
+        close_button.clicked.connect(self.accept)
+        close_row.addWidget(close_button)
+        right.addLayout(close_row)
+
+        layout.addLayout(right, stretch=2)
+
+        self._refresh_server_list()
+        if self._servers:
+            self.server_list.setCurrentRow(0)
+        else:
+            self._set_form_enabled(False)
+
+    def get_presets(self) -> list[dict]:
+        return [dict(server) for server in self._servers]
+
+    def _set_form_enabled(self, enabled: bool) -> None:
+        for widget in (self.label_edit, self.host_edit, self.port_spin, self.user_edit, self.password_edit):
+            widget.setEnabled(enabled)
+        self.delete_button.setEnabled(enabled)
+        self.test_button.setEnabled(enabled)
+        self.save_button.setEnabled(enabled)
+
+    def _refresh_server_list(self) -> None:
+        current_key = self._get_selected_server_key()
+        self.server_list.blockSignals(True)
+        self.server_list.clear()
+        for server in self._servers:
+            label = str(server.get("label", "未命名服务器")).strip() or "未命名服务器"
+            host = str(server.get("host", "")).strip()
+            text = f"{label} ({host})" if host else label
+            self.server_list.addItem(text)
+        self.server_list.blockSignals(False)
+
+        if not self._servers:
+            self._clear_form()
+            self._set_form_enabled(False)
+            return
+
+        target_row = 0
+        if current_key:
+            for index, server in enumerate(self._servers):
+                if str(server.get("key", "")) == current_key:
+                    target_row = index
+                    break
+        self.server_list.setCurrentRow(target_row)
+
+    def _clear_form(self) -> None:
+        self.label_edit.clear()
+        self.host_edit.clear()
+        self.port_spin.setValue(22)
+        self.user_edit.clear()
+        self.password_edit.clear()
+
+    def _get_selected_server_key(self) -> str:
+        row = self.server_list.currentRow()
+        if row < 0 or row >= len(self._servers):
+            return ""
+        return str(self._servers[row].get("key", ""))
+
+    def _on_server_selected(self, row: int) -> None:
+        if row < 0 or row >= len(self._servers):
+            self._clear_form()
+            self._set_form_enabled(False)
+            return
+        self._set_form_enabled(True)
+        server = self._servers[row]
+        self.label_edit.setText(str(server.get("label", "")))
+        self.host_edit.setText(str(server.get("host", "")))
+        self.port_spin.setValue(int(server.get("port", 22) or 22))
+        self.user_edit.setText(str(server.get("username", "")))
+        self.password_edit.setText(str(server.get("password", "")))
+
+    def _collect_form_data(self) -> dict | None:
+        row = self.server_list.currentRow()
+        if row < 0 or row >= len(self._servers):
+            QMessageBox.warning(self, "警告", "请先选择一个服务器")
+            return None
+        label = self.label_edit.text().strip()
+        host = self.host_edit.text().strip()
+        username = self.user_edit.text().strip()
+        password = self.password_edit.text()
+        port = int(self.port_spin.value())
+
+        if not label:
+            QMessageBox.warning(self, "警告", "服务器名称不能为空")
+            return None
+        if not host:
+            QMessageBox.warning(self, "警告", "服务器地址不能为空")
+            return None
+        if not username:
+            QMessageBox.warning(self, "警告", "用户名不能为空")
+            return None
+
+        return {
+            "key": str(self._servers[row].get("key", "")),
+            "label": label,
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+        }
+
+    def _add_server(self) -> None:
+        temp_key = f"__new_server_{self._new_server_counter}"
+        self._new_server_counter += 1
+        self._servers.append(
+            {
+                "key": temp_key,
+                "label": f"新服务器 {len(self._servers) + 1}",
+                "host": "",
+                "port": 22,
+                "username": "",
+                "password": "",
+            }
+        )
+        self._refresh_server_list()
+        self.server_list.setCurrentRow(len(self._servers) - 1)
+        self.label_edit.selectAll()
+        self.label_edit.setFocus()
+
+    def _delete_selected_server(self) -> None:
+        row = self.server_list.currentRow()
+        if row < 0 or row >= len(self._servers):
+            return
+        server = self._servers[row]
+        label = str(server.get("label", "服务器"))
+        result = QMessageBox.question(self, "确认删除", f"确定删除服务器“{label}”吗？")
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        server_key = str(server.get("key", ""))
+        if server_key and not server_key.startswith("__new_server_"):
+            self._delete_server(server_key)
+        self._servers.pop(row)
+        self._refresh_server_list()
+
+    def _test_selected_server(self) -> None:
+        data = self._collect_form_data()
+        if data is None:
+            return
+        success, message = self._test_server(data)
+        if success:
+            QMessageBox.information(self, "连接测试", message)
+        else:
+            QMessageBox.critical(self, "连接测试失败", message)
+
+    def _save_selected_server(self) -> None:
+        data = self._collect_form_data()
+        if data is None:
+            return
+        row = self.server_list.currentRow()
+        server_key = data.get("key", "")
+        if server_key.startswith("__new_server_"):
+            server_key = None
+        saved = self._save_server(data, server_key)
+        self._servers[row] = dict(saved)
+        self._refresh_server_list()
+        self.server_list.setCurrentRow(row)
+        QMessageBox.information(self, "已保存", f"服务器“{saved['label']}”已保存")
 
 
 class ErrormapDialog(QDialog):

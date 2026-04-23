@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
 from pickpix_app.backend import PickPixBackend
 from pickpix_app.config import AppConfig
 
-from .dialogs import ErrormapDialog, RemoteSourceDialog, SettingsDialog
+from .dialogs import ErrormapDialog, RemoteSourceDialog, ServerManagerDialog, SettingsDialog
 from .flow_layout import FlowLayout
 from .preview_canvas import PreviewCanvas, pil_to_qimage
 
@@ -271,6 +271,7 @@ class PickPixMainWindow(QMainWindow):
         self.input_label.setStyleSheet("color: gray;")
         row.addWidget(self.input_label)
         row.addWidget(btn("清空输入", "#9E9E9E", self.clear_input_folders))
+        row.addWidget(btn("服务器管理", "#6D4C41", self.open_server_manager))
         row.addWidget(btn("设置", "#795548", self.open_settings_dialog))
 
         row.addSpacing(12)
@@ -554,6 +555,132 @@ class PickPixMainWindow(QMainWindow):
 
     def _copy_mapping(self, data: Any) -> dict:
         return dict(data) if isinstance(data, dict) else {}
+
+    def _find_server_key_for_source(self, source: Any) -> str:
+        mapping = self._copy_mapping(source)
+        if mapping.get("type") != "sftp":
+            return ""
+
+        server_key = str(mapping.get("server_key", "")).strip()
+        if server_key and self.config.get_server_preset(server_key):
+            return server_key
+
+        host = str(mapping.get("host", "")).strip()
+        username = str(mapping.get("username", "")).strip()
+        password = str(mapping.get("password", ""))
+        try:
+            port = int(mapping.get("port", 22))
+        except (TypeError, ValueError):
+            port = 22
+
+        for preset in self.config.list_server_presets():
+            if (
+                str(preset.get("host", "")).strip() == host
+                and int(preset.get("port", 22)) == port
+                and str(preset.get("username", "")).strip() == username
+                and str(preset.get("password", "")) == password
+            ):
+                return str(preset.get("key", ""))
+        return ""
+
+    def _serialize_source_config_for_workspace(self, source: Any) -> dict:
+        mapping = self._copy_mapping(source)
+        if mapping.get("type") != "sftp":
+            return mapping
+
+        result = {
+            "type": "sftp",
+            "path": str(mapping.get("path", "")).strip(),
+        }
+        server_key = self._find_server_key_for_source(mapping)
+        if server_key:
+            result["server_key"] = server_key
+            preset = self.config.get_server_preset(server_key)
+            if preset is not None:
+                result["server_label"] = str(preset.get("label", server_key))
+        elif mapping.get("server_label"):
+            result["server_label"] = str(mapping.get("server_label", ""))
+        return result
+
+    def _resolve_workspace_source(self, source: Any) -> tuple[dict | None, str | None]:
+        mapping = self._copy_mapping(source)
+        if not mapping:
+            return None, None
+        if mapping.get("type") != "sftp":
+            return mapping, None
+
+        remote_path = str(mapping.get("path", "")).strip()
+        if not remote_path:
+            return None, "远程配置缺少路径，已跳过"
+
+        server_key = str(mapping.get("server_key", "")).strip()
+        if server_key:
+            resolved = self.config.build_remote_target(server_key, remote_path)
+            if resolved is None:
+                label = str(mapping.get("server_label", server_key))
+                return None, f"服务器 {label} 不存在或已被删除，相关远程配置已跳过"
+            return resolved, None
+
+        if mapping.get("host") and mapping.get("username"):
+            matched_key = self._find_server_key_for_source(mapping)
+            if matched_key:
+                resolved = self.config.build_remote_target(matched_key, remote_path)
+                if resolved is not None:
+                    label = str(resolved.get("server_label", matched_key))
+                    return resolved, f"旧工程中的远程配置已映射到软件服务器“{label}”"
+
+            legacy = {
+                "type": "sftp",
+                "host": str(mapping.get("host", "")),
+                "port": int(mapping.get("port", 22) or 22),
+                "username": str(mapping.get("username", "")),
+                "password": str(mapping.get("password", "")),
+                "path": remote_path,
+                "server_key": "",
+                "server_label": str(mapping.get("server_label", mapping.get("host", "远程服务器"))),
+            }
+            label = str(legacy.get("server_label", "远程服务器"))
+            return legacy, f"工程文件仍包含旧版服务器凭证“{label}”，建议在软件中保存服务器后重新保存工程"
+
+        return None, "远程配置缺少服务器引用，已跳过"
+
+    def _refresh_runtime_remote_sources(self) -> None:
+        refreshed_sources: list[dict] = []
+        for source in self.input_sources:
+            mapping = self._copy_mapping(source)
+            if mapping.get("type") != "sftp":
+                refreshed_sources.append(mapping)
+                continue
+            server_key = str(mapping.get("server_key", "")).strip()
+            if server_key:
+                resolved = self.config.build_remote_target(server_key, str(mapping.get("path", "")))
+                refreshed_sources.append(resolved if resolved is not None else mapping)
+            else:
+                refreshed_sources.append(mapping)
+        self.input_sources = refreshed_sources
+
+        if isinstance(self.output_target, dict) and self.output_target.get("type") == "sftp":
+            server_key = str(self.output_target.get("server_key", "")).strip()
+            if server_key:
+                resolved_output = self.config.build_remote_target(server_key, str(self.output_target.get("path", "")))
+                if resolved_output is not None:
+                    self.output_target = resolved_output
+
+        for entry in self.method_entries.values():
+            if entry.get("type") != "source":
+                continue
+            source = entry.get("source", {})
+            if not isinstance(source, dict) or source.get("type") != "sftp":
+                continue
+            server_key = str(source.get("server_key", "")).strip()
+            if not server_key:
+                continue
+            resolved_source = self.config.build_remote_target(server_key, str(source.get("path", "")))
+            if resolved_source is not None:
+                entry["source"] = resolved_source
+
+        self._rebuild_method_source_maps()
+        self._update_output_label()
 
     def _get_current_frame_num(self) -> str | None:
         if not self.frame_numbers:
@@ -936,9 +1063,11 @@ class PickPixMainWindow(QMainWindow):
             return
         presets = self._get_server_presets()
         if not presets:
-            QMessageBox.warning(self, "警告", "config 中没有可用的服务器预设")
+            presets = self.open_server_manager()
+        if not presets:
+            QMessageBox.warning(self, "警告", "请先在软件中添加服务器配置")
             return
-        dialog = RemoteSourceDialog("添加远程 SFTP 输入", "远程路径", "添加", presets, self)
+        dialog = RemoteSourceDialog("添加远程 SFTP 输入", "远程路径", "添加", presets, self.open_server_manager, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         result = dialog.get_result()
@@ -948,19 +1077,50 @@ class PickPixMainWindow(QMainWindow):
         self.scan_methods_and_frames()
 
     def _get_server_presets(self) -> list[dict]:
-        presets: list[dict] = []
-        for key, preset in self.config.server_presets.items():
-            presets.append(
-                {
-                    "key": key,
-                    "label": str(preset.get("label", key)),
-                    "host": str(preset.get("host", "")),
-                    "port": str(preset.get("port", 22)),
-                    "username": str(preset.get("username", "")),
-                    "password": str(preset.get("password", "")),
-                }
-            )
-        return presets
+        return self.config.list_server_presets()
+
+    def _save_server_preset(self, data: dict, server_key: str | None) -> dict:
+        saved = self.config.save_server_preset(data, server_key)
+        self._refresh_runtime_remote_sources()
+        return saved
+
+    def _delete_server_preset(self, server_key: str) -> bool:
+        deleted = self.config.delete_server_preset(server_key)
+        self._refresh_runtime_remote_sources()
+        return deleted
+
+    def _test_server_preset(self, data: dict) -> tuple[bool, str]:
+        if not self.backend.is_remote_available:
+            return False, "未安装 paramiko，暂时无法测试远程连接"
+        try:
+            normalized = self.config.normalize_server_preset(data)
+            runtime = {
+                "type": "sftp",
+                "host": normalized["host"],
+                "port": int(normalized["port"]),
+                "username": normalized["username"],
+                "password": normalized["password"],
+                "path": "/",
+            }
+            sftp = self.backend.storage.get_sftp_client(runtime)
+            sftp.listdir(".")
+            connection_key = self.backend.storage.get_remote_connection_key(runtime)
+            self.backend.storage.close_remote_connection(connection_key)
+            return True, f"连接成功: {normalized['label']}"
+        except Exception as exc:
+            return False, str(exc)
+
+    def open_server_manager(self) -> list[dict]:
+        dialog = ServerManagerDialog(
+            self._get_server_presets(),
+            self._save_server_preset,
+            self._delete_server_preset,
+            self._test_server_preset,
+            self,
+        )
+        dialog.exec()
+        self._refresh_runtime_remote_sources()
+        return self._get_server_presets()
 
     def clear_input_folders(self) -> None:
         if not self.is_restoring_workspace and not self._prompt_save_workspace_if_dirty("清空输入"):
@@ -984,9 +1144,11 @@ class PickPixMainWindow(QMainWindow):
             return
         presets = self._get_server_presets()
         if not presets:
-            QMessageBox.warning(self, "警告", "config 中没有可用的服务器预设")
+            presets = self.open_server_manager()
+        if not presets:
+            QMessageBox.warning(self, "警告", "请先在软件中添加服务器配置")
             return
-        dialog = RemoteSourceDialog("设置远程 SFTP 输出", "远程输出路径", "确定", presets, self)
+        dialog = RemoteSourceDialog("设置远程 SFTP 输出", "远程输出路径", "确定", presets, self.open_server_manager, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         result = dialog.get_result()
@@ -1627,7 +1789,7 @@ class PickPixMainWindow(QMainWindow):
             "type": "source",
             "origin": entry.get("origin", "scan"),
             "path": str(entry.get("path", "")),
-            "source": self._copy_mapping(entry.get("source", {})),
+            "source": self._serialize_source_config_for_workspace(entry.get("source", {})),
         }
 
     def _get_workspace_methods_state(self) -> list[dict]:
@@ -1654,8 +1816,8 @@ class PickPixMainWindow(QMainWindow):
         return {
             "workspace": {
                 "version": 1,
-                "input_sources": [self._copy_mapping(src) for src in self.input_sources],
-                "output_target": self._copy_mapping(self.output_target),
+                "input_sources": [self._serialize_source_config_for_workspace(src) for src in self.input_sources],
+                "output_target": self._serialize_source_config_for_workspace(self.output_target),
                 "current_frame": self._get_current_frame_num(),
                 "methods": self._get_workspace_methods_state(),
                 "crop_boxes": [list(box) for box in self.crop_boxes],
@@ -1740,14 +1902,28 @@ class PickPixMainWindow(QMainWindow):
         try:
             self._clear_workspace_state(clear_output=True, preserve_workspace_path=False)
 
-            self.input_sources = [self._copy_mapping(src) for src in workspace.get("input_sources", []) if isinstance(src, dict)]
+            self.input_sources = []
+            for source in workspace.get("input_sources", []):
+                if not isinstance(source, dict):
+                    continue
+                resolved_source, warning = self._resolve_workspace_source(source)
+                if warning:
+                    warnings.append(warning)
+                if resolved_source is not None:
+                    self.input_sources.append(resolved_source)
             self.input_folders = [str(src.get("path", "")) for src in self.input_sources if src.get("type") == "local"]
             self.input_folder = self.input_folders[0] if self.input_folders else ""
 
             output_target = workspace.get("output_target", {})
             if isinstance(output_target, dict) and output_target:
-                self.output_target = self._copy_mapping(output_target)
-                self.output_folder = str(self.output_target.get("path", self.output_folder))
+                resolved_output, warning = self._resolve_workspace_source(output_target)
+                if warning:
+                    warnings.append(warning)
+                self.output_target = resolved_output
+                if self.output_target is not None:
+                    self.output_folder = str(self.output_target.get("path", self.output_folder))
+                else:
+                    self.output_folder = str(self.config.default_output_dir)
             else:
                 self.output_target = None
                 self.output_folder = str(self.config.default_output_dir)
@@ -1810,7 +1986,13 @@ class PickPixMainWindow(QMainWindow):
                             warnings.append(f"方法 {name} 已不存在，已跳过")
                     elif etype == "source":
                         source = entry_data.get("source", {})
-                        self.method_entries[name] = self._build_source_method_entry(source, entry_data.get("path", ""), origin=origin)
+                        resolved_source, warning = self._resolve_workspace_source(source)
+                        if warning:
+                            warnings.append(f"方法 {name}: {warning}")
+                        if resolved_source is None:
+                            warnings.append(f"方法 {name} 缺少可用来源，已跳过")
+                            continue
+                        self.method_entries[name] = self._build_source_method_entry(resolved_source, entry_data.get("path", ""), origin=origin)
                         self.all_methods.append(name)
                     elif etype == "errormap":
                         parents = entry_data.get("parents", [])

@@ -63,7 +63,7 @@ PickPix 是一个基于 Python + PySide6 的多方法图片对比、书签管理
 - 预览大小
 - 缩放和平移状态
 
-注意：远程 SFTP 账号信息会随工程文件一起保存，工程文件中可能包含明文密码。
+说明：工程文件中的远程输入/输出只保存服务器引用和远程路径，不再保存远程账号密码。服务器信息保存在软件自己的配置文件中。
 
 ## 环境要求
 
@@ -175,6 +175,7 @@ method_a/
 ### 帧导航与视图
 
 - 上一帧 / 下一帧：循环切换
+- 上 10 帧 / 下 10 帧：按 10 帧跳转，到首尾时自动停住
 - 跳转：输入帧号后定位到指定帧
 - 收藏当前帧 / 取消收藏当前帧
 - 上一书签 / 下一书签 / 书签下拉跳转
@@ -205,9 +206,9 @@ method_a/
 
 输出内容：
 
-- 每个方法下的裁剪图：`frame帧号_box1.png`、`frame帧号_box2.png` 等
-- 每个方法下的框可视化图：`frame帧号_boxes_map.png`
-- 输出根目录下的当前帧总览图：`frame帧号_summary.png`
+- 当前帧目录下每个方法的裁剪图：`frame帧号/method_x/frame帧号_box1.png`、`frame帧号_box2.png` 等
+- 当前帧目录下每个方法的框可视化图：`frame帧号/method_x/frame帧号_boxes_map.png`
+- 当前帧目录根部的总览图：`frame帧号/frame帧号_summary.png`
 
 ### 批量裁剪所有帧
 
@@ -233,20 +234,23 @@ method_a/
 
 ```text
 output_root/
-  method_a/
-    frame0001_box1.png
-    frame0001_box2.png
-    frame0001_boxes_map.png
-    frame0002_box1.png
-  method_b/
-    frame0001_box1.png
-    frame0001_boxes_map.png
-  frame0001_summary.png
+  frame0001/
+    frame0001_summary.png
+    method_a/
+      frame0001_box1.png
+      frame0001_box2.png
+      frame0001_boxes_map.png
+    method_b/
+      frame0001_box1.png
+      frame0001_boxes_map.png
+  frame0002/
+    method_a/
+      frame0002_box1.png
 ```
 
 ## 远程 SFTP 配置
 
-服务器预设来自 [config/paths.yaml](config/paths.yaml) 的 `servers` 节点。
+服务器信息会保存在软件目录下的 [config/paths.yaml](config/paths.yaml) 的 `servers` 节点中。你可以直接编辑 YAML，也可以在软件里点击“服务器管理”进行维护。
 
 示例：
 
@@ -263,7 +267,9 @@ servers:
 说明：
 
 - 可以配置多个服务器预设
-- 界面会自动读取并列出这些预设
+- 可以在软件里新增、删除、修改服务器，并测试连接
+- 远程输入和远程输出都会从这份服务器列表中选择
+- 工程文件只会记录所选服务器的 key 和标签，不会保存密码
 - 远程路径必须是绝对路径，且以 `/` 开头
 
 ## 打包 exe
@@ -303,4 +309,4 @@ pickpix_app/
 
 - 旧版 Tkinter 前端代码仍在仓库中保留作参考，但当前运行入口已经切换为 PySide6 前端
 - `dist/pickpix.exe` 已可直接启动使用
-- 工程文件建议单独管理，避免把包含远程密码的工程文件提交到公共仓库
+- 工程文件建议单独管理；虽然远程密码已不再写入工程文件，但服务器配置仍属于本机软件数据

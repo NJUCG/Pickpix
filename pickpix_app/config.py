@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -208,6 +209,130 @@ class AppConfig:
     def server_presets(self) -> dict[str, dict[str, Any]]:
         presets = self.data.get("servers", {})
         return presets if isinstance(presets, dict) else {}
+
+    def _get_servers_store(self) -> dict[str, dict[str, Any]]:
+        servers = self.data.setdefault("servers", {})
+        if not isinstance(servers, dict):
+            servers = {}
+            self.data["servers"] = servers
+        return servers
+
+    @staticmethod
+    def _normalize_server_port(value: Any) -> int:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            port = 22
+        return max(1, min(65535, port))
+
+    @staticmethod
+    def _make_server_key(label: str, existing_keys: set[str], preferred_key: str | None = None) -> str:
+        if preferred_key:
+            normalized = re.sub(r"[^a-z0-9_]+", "_", preferred_key.strip().lower()).strip("_")
+            if normalized and normalized not in existing_keys:
+                return normalized
+
+        base = re.sub(r"[^a-z0-9_]+", "_", label.strip().lower()).strip("_")
+        if not base:
+            base = "server"
+        candidate = base
+        index = 2
+        while candidate in existing_keys:
+            candidate = f"{base}_{index}"
+            index += 1
+        return candidate
+
+    def normalize_server_preset(self, data: dict[str, Any]) -> dict[str, Any]:
+        label = str(data.get("label", "")).strip()
+        host = str(data.get("host", "")).strip()
+        username = str(data.get("username", "")).strip()
+        password = str(data.get("password", ""))
+        port = self._normalize_server_port(data.get("port", 22))
+
+        if not label:
+            raise ValueError("服务器名称不能为空")
+        if not host:
+            raise ValueError("服务器地址不能为空")
+        if not username:
+            raise ValueError("用户名不能为空")
+
+        return {
+            "label": label,
+            "host": host,
+            "port": port,
+            "username": username,
+            "password": password,
+        }
+
+    def list_server_presets(self) -> list[dict[str, Any]]:
+        presets: list[dict[str, Any]] = []
+        for key, preset in self.server_presets.items():
+            if not isinstance(preset, dict):
+                continue
+            presets.append(
+                {
+                    "key": str(key),
+                    "label": str(preset.get("label", key)),
+                    "host": str(preset.get("host", "")),
+                    "port": self._normalize_server_port(preset.get("port", 22)),
+                    "username": str(preset.get("username", "")),
+                    "password": str(preset.get("password", "")),
+                }
+            )
+        return presets
+
+    def get_server_preset(self, server_key: str) -> dict[str, Any] | None:
+        preset = self.server_presets.get(server_key)
+        if not isinstance(preset, dict):
+            return None
+        normalized = self.normalize_server_preset({
+            "label": preset.get("label", server_key),
+            "host": preset.get("host", ""),
+            "port": preset.get("port", 22),
+            "username": preset.get("username", ""),
+            "password": preset.get("password", ""),
+        })
+        normalized["key"] = str(server_key)
+        return normalized
+
+    def save_server_preset(self, data: dict[str, Any], server_key: str | None = None) -> dict[str, Any]:
+        normalized = self.normalize_server_preset(data)
+        servers = self._get_servers_store()
+
+        key = str(server_key or data.get("key", "")).strip()
+        if key and key not in servers:
+            key = ""
+
+        if not key:
+            existing_keys = set(servers.keys())
+            key = self._make_server_key(normalized["label"], existing_keys, str(data.get("key", "")).strip() or None)
+
+        servers[key] = normalized
+        self._write()
+        return {"key": key, **normalized}
+
+    def delete_server_preset(self, server_key: str) -> bool:
+        servers = self._get_servers_store()
+        if server_key not in servers:
+            return False
+        servers.pop(server_key, None)
+        self._write()
+        return True
+
+    def build_remote_target(self, server_key: str, remote_path: str) -> dict[str, Any] | None:
+        preset = self.get_server_preset(server_key)
+        if preset is None:
+            return None
+        return {
+            "type": "sftp",
+            "host": preset["host"],
+            "port": int(preset["port"]),
+            "username": preset["username"],
+            "password": preset["password"],
+            "path": str(remote_path),
+            "server_key": preset["key"],
+            "server_label": preset["label"],
+        }
 
     @property
     def input_filename_patterns(self) -> list[str]:
