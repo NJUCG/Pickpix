@@ -341,12 +341,18 @@ class PickPixMainWindow(QMainWindow):
         v.addWidget(self.preview_scroll, stretch=1)
 
         nav_row = QHBoxLayout()
+        prev10_btn = QPushButton("⏪ 上10帧")
+        prev10_btn.clicked.connect(self.prev_ten_frames)
+        nav_row.addWidget(prev10_btn)
         prev_btn = QPushButton("◀ 上一帧")
         prev_btn.clicked.connect(self.prev_frame)
         nav_row.addWidget(prev_btn)
         next_btn = QPushButton("下一帧 ▶")
         next_btn.clicked.connect(self.next_frame)
         nav_row.addWidget(next_btn)
+        next10_btn = QPushButton("下10帧 ⏩")
+        next10_btn.clicked.connect(self.next_ten_frames)
+        nav_row.addWidget(next10_btn)
         self.frame_info_label = QLabel("帧: 0 / 0")
         self.frame_info_label.setStyleSheet("font-weight: bold;")
         nav_row.addSpacing(8)
@@ -1371,16 +1377,25 @@ class PickPixMainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ frame navigation
     def prev_frame(self) -> None:
+        self._jump_relative_frame(-1, clamp=False)
+
+    def prev_ten_frames(self) -> None:
+        self._jump_relative_frame(-10, clamp=True)
+
+    def next_ten_frames(self) -> None:
+        self._jump_relative_frame(10, clamp=True)
+
+    def _jump_relative_frame(self, step: int, clamp: bool) -> None:
         if not self.frame_numbers:
             return
-        target = (self.current_frame_index - 1) % len(self.frame_numbers)
+        if clamp:
+            target = max(0, min(self.current_frame_index + step, len(self.frame_numbers) - 1))
+        else:
+            target = (self.current_frame_index + step) % len(self.frame_numbers)
         self._set_current_frame_by_num(self.frame_numbers[target])
 
     def next_frame(self) -> None:
-        if not self.frame_numbers:
-            return
-        target = (self.current_frame_index + 1) % len(self.frame_numbers)
-        self._set_current_frame_by_num(self.frame_numbers[target])
+        self._jump_relative_frame(1, clamp=False)
 
     def jump_to_frame(self) -> None:
         text = self.frame_jump_edit.text().strip()
