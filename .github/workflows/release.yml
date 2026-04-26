@@ -1,0 +1,58 @@
+name: Build And Release
+
+"on":
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name pickpix pickpix.py
+          New-Item -ItemType Directory -Force -Path dist/config | Out-Null
+          Copy-Item -Force config/paths.yaml dist/config/paths.yaml
+          Compress-Archive -Path dist/pickpix.exe, dist/config/paths.yaml -DestinationPath dist/pickpix-windows.zip -Force
+
+      - name: Publish latest release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: latest
+          name: Latest Build
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: dist/pickpix.exe,dist/config/paths.yaml,dist/pickpix-windows.zip
+          body: |
+            Automated build from commit ${{ github.sha }}.
+            - pickpix.exe: Windows executable
+            - paths.yaml: runtime configuration
+            - pickpix-windows.zip: bundled release package
+          commit: ${{ github.sha }}

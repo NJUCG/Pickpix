@@ -178,6 +178,88 @@ class MultiMethodCropperGUI:
             )
         return method_states
 
+    def apply_scan_result_preserving_methods(self, result):
+        previous_scanned_methods = set(self.scanned_methods)
+        state_map = {
+            str(item.get("name", "")).strip(): item
+            for item in self.get_workspace_methods_state()
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        }
+        scanned_entry_map = {
+            method: self.build_source_method_entry(result.method_sources[method], result.method_paths[method], origin="scan")
+            for method in result.methods
+        }
+
+        next_entries = {}
+        next_methods = []
+        next_defaults = {}
+
+        for method in self.all_methods:
+            entry = self.method_entries.get(method)
+            if not entry:
+                continue
+
+            state = state_map.get(method, {})
+            serialized_entry = state.get("entry") if isinstance(state, dict) else None
+            if not isinstance(serialized_entry, dict):
+                serialized_entry = self.serialize_method_entry(entry)
+
+            entry_type = serialized_entry.get("type", entry.get("type", "source"))
+            origin = str(serialized_entry.get("origin", entry.get("origin", "scan")))
+
+            if entry_type == "source" and origin == "scan":
+                scanned_entry = scanned_entry_map.get(method)
+                if scanned_entry is None:
+                    continue
+                next_entries[method] = scanned_entry
+            elif entry_type == "source":
+                next_entries[method] = self.build_source_method_entry(entry.get("source", {}), entry.get("path", ""), origin=origin)
+            elif entry_type == "errormap":
+                parents = entry.get("parents", ())
+                if len(parents) != 2:
+                    continue
+                next_entries[method] = self.build_errormap_method_entry(str(parents[0]), str(parents[1]), origin=origin)
+            else:
+                continue
+
+            next_methods.append(method)
+            next_defaults[method] = {
+                "selected": bool(state.get("selected", method in self.methods)),
+                "offset": str(state.get("offset", 0)),
+            }
+
+        for method in result.methods:
+            if method in next_entries:
+                continue
+            if method in previous_scanned_methods:
+                continue
+            next_entries[method] = scanned_entry_map[method]
+            next_methods.append(method)
+            next_defaults[method] = {"selected": True, "offset": "0"}
+
+        valid_names = set(next_entries.keys())
+        filtered_methods = []
+        for method in next_methods:
+            entry = next_entries.get(method)
+            if not entry:
+                continue
+            if entry.get("type") == "errormap":
+                parents = entry.get("parents", ())
+                if any(parent not in valid_names for parent in parents):
+                    next_entries.pop(method, None)
+                    next_defaults.pop(method, None)
+                    continue
+            filtered_methods.append(method)
+
+        self.scanned_methods = list(result.methods)
+        self.method_entries = next_entries
+        self.all_methods = filtered_methods
+        self.methods = list(filtered_methods)
+        self.method_ui_defaults = next_defaults
+        self.rebuild_method_source_maps()
+        self.methods_with_frames = [method for method in result.methods_with_frames if method in next_entries]
+        self.frame_numbers = result.frame_numbers
+
     def serialize_method_entry(self, entry):
         if entry.get("type") == "errormap":
             return {
@@ -1868,22 +1950,11 @@ class MultiMethodCropperGUI:
             messagebox.showwarning("警告", message)
             return
         
-        self.scanned_methods = list(result.methods)
-        self.method_entries = {
-            method: self.build_source_method_entry(result.method_sources[method], result.method_paths[method], origin="scan")
-            for method in result.methods
-        }
-        self.all_methods = result.methods
-        self.methods = list(result.methods)
-        self.rebuild_method_source_maps()
-        self.method_ui_defaults = {}
-        self.methods_with_frames = result.methods_with_frames
-        self.frame_numbers = result.frame_numbers
+        self.apply_scan_result_preserving_methods(result)
 
         self.rebuild_method_filter_ui()
         self.refresh_visible_methods(reload_frame=False)
-        methods_with_frames = result.methods_with_frames
-        self.frame_numbers = result.frame_numbers
+        methods_with_frames = self.methods_with_frames
         
         if not self.frame_numbers:
             messagebox.showwarning(

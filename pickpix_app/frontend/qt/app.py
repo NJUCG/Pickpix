@@ -17,7 +17,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
 from PIL import Image
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QImage, QIntValidator, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QImage, QIntValidator, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -143,6 +143,7 @@ class PreviewCell(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setFrameShadow(QFrame.Shadow.Raised)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._title_text = title
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -151,6 +152,8 @@ class PreviewCell(QFrame):
         self.title_label = QLabel(title, self)
         self.title_label.setStyleSheet("background-color: #E3F2FD; color: #102030; padding: 4px;")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         font = QFont()
         font.setBold(True)
         self.title_label.setFont(font)
@@ -161,6 +164,24 @@ class PreviewCell(QFrame):
         layout.addWidget(self.canvas)
 
         self.setFixedSize(view_size + 16, view_size + 46)
+        self._update_title_label()
+
+    def set_title(self, title: str) -> None:
+        self._title_text = title
+        self._update_title_label()
+
+    def _update_title_label(self) -> None:
+        metrics = QFontMetrics(self.title_label.font())
+        available_width = max(0, self.title_label.width() - 8)
+        if available_width <= 0:
+            available_width = max(0, self.width() - 16)
+        display_title = metrics.elidedText(self._title_text, Qt.TextElideMode.ElideRight, available_width)
+        self.title_label.setText(display_title)
+        self.title_label.setToolTip(self._title_text)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_title_label()
 
 
 class PickPixMainWindow(QMainWindow):
@@ -318,6 +339,7 @@ class PickPixMainWindow(QMainWindow):
 
         row.addWidget(btn("保存工程", "#00897B", self.save_workspace))
         row.addWidget(btn("工程另存", "#26A69A", self.save_workspace_as))
+        row.addWidget(btn("新工程", "#7E57C2", self.new_workspace))
         row.addWidget(btn("导入工程", "#546E7A", self.load_workspace))
         self.workspace_label = QLabel("工程: 未保存")
         self.workspace_label.setStyleSheet("color: gray;")
@@ -800,7 +822,12 @@ class PickPixMainWindow(QMainWindow):
 
     def _get_method_title(self, method: str, logical_frame_num: str) -> str:
         entry = self._get_method_entry(method) or {}
-        base_title = self._get_method_list_label(method)
+        tags: list[str] = []
+        if entry.get("origin") == "clone":
+            tags.append("克隆")
+        if entry.get("type") == "errormap":
+            tags.append("差分")
+        base_title = method if not tags else f"{method} [{' / '.join(tags)}]"
         render_frame_num = self._get_method_render_frame_num(method, logical_frame_num)
         offset = self._get_method_offset(method)
         details: list[str] = []
@@ -821,8 +848,8 @@ class PickPixMainWindow(QMainWindow):
                 details.append("差分 " + " vs ".join(parent_frames))
 
         if not details:
-            return shorten_text(base_title, 32)
-        return shorten_text(f"{base_title} ({'; '.join(details)})", 32)
+            return base_title
+        return f"{base_title} ({'; '.join(details)})"
 
     def _get_source_frame_image_entry(self, source: dict, frame_num: str) -> str | None:
         return self.backend.get_frame_image_entry({"__src__": source}, "__src__", frame_num)
@@ -1198,17 +1225,7 @@ class PickPixMainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", message)
             return
 
-        self.scanned_methods = list(result.methods)
-        self.method_entries = {
-            method: self._build_source_method_entry(result.method_sources[method], result.method_paths[method], origin="scan")
-            for method in result.methods
-        }
-        self.all_methods = list(result.methods)
-        self.methods = list(result.methods)
-        self._rebuild_method_source_maps()
-        self.method_ui_defaults = {}
-        self.methods_with_frames = result.methods_with_frames
-        self.frame_numbers = result.frame_numbers
+        self._apply_scan_result_preserving_methods(result)
 
         self._rebuild_method_panel()
         self.refresh_visible_methods(reload_frame=False)
@@ -1811,6 +1828,88 @@ class PickPixMainWindow(QMainWindow):
             )
         return states
 
+    def _apply_scan_result_preserving_methods(self, result) -> None:
+        previous_scanned_methods = set(self.scanned_methods)
+        state_map = {
+            str(item.get("name", "")).strip(): item
+            for item in self._get_workspace_methods_state()
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        }
+        scanned_entry_map = {
+            method: self._build_source_method_entry(result.method_sources[method], result.method_paths[method], origin="scan")
+            for method in result.methods
+        }
+
+        next_entries: dict[str, dict] = {}
+        next_methods: list[str] = []
+        next_defaults: dict[str, dict] = {}
+
+        for method in self.all_methods:
+            entry = self.method_entries.get(method)
+            if not entry:
+                continue
+
+            state = state_map.get(method, {})
+            serialized_entry = state.get("entry") if isinstance(state, dict) else None
+            if not isinstance(serialized_entry, dict):
+                serialized_entry = self._serialize_method_entry(entry)
+
+            entry_type = serialized_entry.get("type", entry.get("type", "source"))
+            origin = str(serialized_entry.get("origin", entry.get("origin", "scan")))
+
+            if entry_type == "source" and origin == "scan":
+                scanned_entry = scanned_entry_map.get(method)
+                if scanned_entry is None:
+                    continue
+                next_entries[method] = scanned_entry
+            elif entry_type == "source":
+                next_entries[method] = self._build_source_method_entry(entry.get("source", {}), entry.get("path", ""), origin=origin)
+            elif entry_type == "errormap":
+                parents = entry.get("parents", ())
+                if len(parents) != 2:
+                    continue
+                next_entries[method] = self._build_errormap_method_entry(str(parents[0]), str(parents[1]), origin=origin)
+            else:
+                continue
+
+            next_methods.append(method)
+            next_defaults[method] = {
+                "selected": bool(state.get("selected", method in self.methods)),
+                "offset": int(state.get("offset", 0) or 0),
+            }
+
+        for method in result.methods:
+            if method in next_entries:
+                continue
+            if method in previous_scanned_methods:
+                continue
+            next_entries[method] = scanned_entry_map[method]
+            next_methods.append(method)
+            next_defaults[method] = {"selected": True, "offset": 0}
+
+        valid_names = set(next_entries.keys())
+        filtered_methods: list[str] = []
+        for method in next_methods:
+            entry = next_entries.get(method)
+            if not entry:
+                continue
+            if entry.get("type") == "errormap":
+                parents = entry.get("parents", ())
+                if any(parent not in valid_names for parent in parents):
+                    next_entries.pop(method, None)
+                    next_defaults.pop(method, None)
+                    continue
+            filtered_methods.append(method)
+
+        self.scanned_methods = list(result.methods)
+        self.method_entries = next_entries
+        self.all_methods = filtered_methods
+        self.methods = list(filtered_methods)
+        self.method_ui_defaults = next_defaults
+        self._rebuild_method_source_maps()
+        self.methods_with_frames = [method for method in result.methods_with_frames if method in next_entries]
+        self.frame_numbers = result.frame_numbers
+
     def _build_workspace_data(self) -> dict:
         self._sync_current_frame_crop_boxes()
         return {
@@ -1858,6 +1957,14 @@ class PickPixMainWindow(QMainWindow):
         if not file_path:
             return False
         return self._save_workspace_to_path(file_path)
+
+    def new_workspace(self) -> bool:
+        if not self._prompt_save_workspace_if_dirty("创建新工程"):
+            return False
+        self._clear_workspace_state(clear_output=True, preserve_workspace_path=False)
+        self._mark_workspace_clean()
+        self.status.showMessage("已创建新工程")
+        return True
 
     def _save_workspace_to_path(self, file_path: str) -> bool:
         try:

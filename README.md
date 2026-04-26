@@ -101,6 +101,22 @@ python pickpix.py
 
 当前入口为 [pickpix.py](pickpix.py)，会启动 PySide6 图形界面。
 
+## 自动发布
+
+仓库已配置 GitHub Actions 工作流 [release.yml](.github/workflows/release.yml)。
+
+行为如下：
+
+- 当代码 push 到 `main` 或 `master` 时，自动在 Windows 环境构建 `dist/pickpix.exe`
+- 构建后会补齐 `dist/config/paths.yaml`
+- 工作流会自动更新 GitHub 上 tag 为 `latest` 的 Release
+- Release 中会上传以下产物：
+  - `pickpix.exe`
+  - `paths.yaml`
+  - `pickpix-windows.zip`
+
+如果需要，也可以在 GitHub Actions 页面手动触发一次发布。
+
 ## 输入数据组织
 
 ### 本地输入
